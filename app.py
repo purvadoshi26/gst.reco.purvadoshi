@@ -1,7 +1,7 @@
 """
 GST Audit Reconciliation Tool
 Created by: Purva Doshi | linkedin.com/in/purvadoshi26
-Tabs: ITC Reco (invoice-wise) | Sales Reco | 3B Check (3B vs GSTR-1 vs Books vs 2B)
+Tabs: ITC Reco | Sales Reco | 3B vs GSTR-1 Check
 """
 import streamlit as st
 import io, re, datetime, hashlib
@@ -1076,12 +1076,12 @@ def build_3b_excel(data_3b,data_1,data_2b_itc,client,period):
 # ─────────────────────────────────────────────────────────────────────────────
 import numpy as np
 HEADS=("igst","cgst","sgst")
-ITC_STAT=["Matched","Matched - Inv No differs","Matched - Rounding","Mismatch","Only in 2B","2B: ITC not available",
+ITC_STAT=["Matched","Matched - Inv No differs","Matched - Rounding","Matched - RCM","Mismatch","Only in 2B","2B: ITC not available",
           "RCM - verify","Only in Books","Nil-tax / cancelled in books"]
-ITC_BG={"Matched":MATCH,"Matched - Inv No differs":"E2EFDA","Matched - Rounding":"E2EFDA","Mismatch":MIS,"Only in 2B":ONLY2,
+ITC_BG={"Matched":MATCH,"Matched - Inv No differs":"E2EFDA","Matched - Rounding":"E2EFDA","Matched - RCM":"EAF4E4","Mismatch":MIS,"Only in 2B":ONLY2,
         "2B: ITC not available":"FCE4D6","RCM - verify":RCM_C,"Only in Books":ONLY1,"Nil-tax / cancelled in books":EXEMPT}
 ITC_MEAN={"Matched":"Invoice in both, GSTIN + tax agree","Matched - Inv No differs":"Same GSTIN + tax; invoice number written differently",
- "Matched - Rounding":"Agrees within rounding tolerance","Mismatch":"Same invoice, tax / taxable / head differs",
+ "Matched - Rounding":"Agrees within rounding tolerance","Matched - RCM":"Reverse-charge invoice booked in RCM ledgers and agrees with 2B - confirm cash payment in 3.1(d)","Mismatch":"Same invoice, tax / taxable / head differs",
  "Only in 2B":"Supplier filed, not booked by client","2B: ITC not available":"On 2B but 2B itself says ITC not available (Sec 16(4)/17(5)/POS etc.)",
  "RCM - verify":"Reverse-charge: tax payable by client first","Only in Books":"Booked, supplier has not reported it - ITC not claimable now",
  "Nil-tax / cancelled in books":"No tax in books and not on 2B - nothing to claim"}
@@ -1095,7 +1095,7 @@ TB_COLS={
  "gstin":[r"^gstin of supplier$",r"^gstin of isd$",r"^gstin/uin of supplier$",r"^gstin"],
  "name": [r"^trade/legal name$",r"^trade name",r"^legal name",r"^name of supplier"],
  "oinv": [r"^original (invoice|note|document) (number|no)"],
- "inv":  [r"^invoice number$",r"^note number$",r"^invoice no\.?$",r"^isd (invoice|credit note) (number|no)",r"^document number$"],
+ "inv":  [r"^invoice number$",r"^note number$",r"^invoice no\.?$",r"^isd (invoice|credit note|document) (number|no)",r"^document number$"],
  "ntype":[r"^note type$",r"^document type$",r"^isd document type$"],
  "date": [r"^invoice date$",r"^note date$",r"^document date$"],
  "value":[r"^invoice value",r"^note value",r"^document value"],
@@ -1106,14 +1106,33 @@ TB_COLS={
 }
 def _role(sn):
     t=sn.strip().lower()
-    if t in ("read me","readme","itc summary","gstr-2b","gstr2b") or t.startswith("itc ") or t in ("eco","ecoa"): return None
-    if t.startswith("b2ba"): return "inv_amd"
+    if any(x in t for x in ("rejected","reversal")): return None
+    if t in ("read me","readme","gstr-2b","gstr2b") or t.startswith("itc ") or t.startswith("eco") or t in ("isda","impga","impgseza"): return None
+    if t.startswith("b2b-dnra"): return "dnote_amd"
+    if t.startswith("b2b-dnr"): return "dnote"
     if "cdnra" in t: return "note_amd"
     if "cdnr" in t: return "note"
+    if t.startswith("b2ba"): return "inv_amd"
     if t.startswith("isd"): return "isd"
+    if t.startswith("impgsez"): return "imp"
     if t.startswith("impg"): return "imp"
     if t.startswith("b2b"): return "inv"
     return None
+
+def _merge2(rows,scan=14):
+    """Portal sheets use a 2-row merged header (group row + sub-row). Return rows with a merged header row inserted."""
+    out=list(rows)
+    for i in range(min(scan,len(rows)-1)):
+        r1,r2=rows[i],rows[i+1]
+        t1=[c for c in r1 if isinstance(c,str) and c.strip()]; t2=[c for c in r2 if isinstance(c,str) and c.strip()]
+        if len(t1)>=3 and len(t2)>=3 and not any(is_num(c) and not isinstance(c,str) for c in r2) and not any(is_num(c) and not isinstance(c,str) for c in r1):
+            if any(re.search(r"integrated tax|central tax|^number$|invoice number|note number|document number",_hn(c)) for c in r2):
+                n=max(len(r1),len(r2)); m=[]
+                for k in range(n):
+                    b=r2[k] if k<len(r2) else None; a=r1[k] if k<len(r1) else None
+                    m.append(b if (b not in (None,"")) else a)
+                out[i+1]=m; return out
+    return out
 
 def parse_2b_full(fb):
     wb=load_wb(fb); inv=[]; notes=[]; isd=[]; imp=[]; layout=[]; warns=[]
@@ -1122,17 +1141,17 @@ def parse_2b_full(fb):
     for ws in wb.worksheets:
         role=_role(ws.title)
         if not role: continue
-        rows=[list(r) for r in ws.iter_rows(values_only=True)]
+        rows=_merge2([list(r) for r in ws.iter_rows(values_only=True)])
         if role=="imp":
             hr=None
             for i,row in enumerate(rows[:15]):
-                if any("port code" in _hn(v) for v in row): hr=i; break
+                if any("port code" in _hn(v) for v in row) and any(re.search(r"^number$|integrated",_hn(v)) for v in row): hr=i; break
             if hr is None: continue
-            hs=[_hn(v) for v in row_ if True] if False else [_hn(v) for v in rows[hr]]
+            hs=[_hn(v) for v in rows[hr]]
             def ix(rx):
                 for i,h in enumerate(hs):
                     if re.search(rx,h): return i
-            c_ref,c_port,c_no,c_dt,c_tx,c_ig=ix(r"reference date|ref"),ix(r"port"),ix(r"^number|be (no|number)|bill of entry"),ix(r"^date|be date"),ix(r"taxable"),ix(r"integrated")
+            c_ref,c_port,c_no,c_dt,c_tx,c_ig=ix(r"reference date|^ref"),ix(r"port"),ix(r"^number$|be (no|number)"),ix(r"^date$|be date"),ix(r"taxable"),ix(r"integrated")
             n0=len(imp)
             for r in rows[hr+1:]:
                 if not any(v not in (None,"") for v in r): continue
@@ -1141,12 +1160,28 @@ def parse_2b_full(fb):
                 imp.append({"Ref Date":str(g(c_ref) or ""),"Port":str(g(c_port) or ""),"BE No":str(g(c_no) or ""),"BE Date":str(to_date(g(c_dt)) or g(c_dt) or ""),
                             "Taxable":num(g(c_tx)),"IGST":num(g(c_ig)),"Sheet":ws.title})
             layout.append({"sheet":ws.title,"role":"Imports (IMPG)","header_row":hr+1,"rows":len(imp)-n0,"mapped":{}}); continue
-        hr,cm=_find_hdr(rows,TB_COLS,["gstin","igst"] if role!="isd" else ["igst"],3)
+        hr,cm=_find_hdr(rows,TB_COLS,["gstin","igst"],3)
         if hr is None:
             hr,cm=_find_hdr(rows,TB_COLS,["gstin"],3)
         if hr is None:
-            warns.append(f"2B sheet '{ws.title}' skipped: header row not recognised."); continue
+            if len(rows)>7: warns.append(f"2B sheet '{ws.title}' skipped: header row not recognised.")
+            continue
         hdr=rows[hr]; n0=len(inv)+len(notes)+len(isd)
+        if role.endswith("_amd"):   # Original-details block sits BEFORE the revised block: re-point to the revised columns
+            gcol=cm["gstin"]; hh=[_hn(v) for v in hdr]
+            def first(rxs,lo,hi):
+                for ci in range(lo,hi):
+                    if any(re.search(x,hh[ci]) for x in rxs): return ci
+            RINV=TB_COLS["inv"]; n=len(hh)
+            o=first(RINV,0,gcol); v=first(RINV,gcol+1,n)
+            if o is not None: cm["oinv"]=o
+            if v is not None: cm["inv"]=v
+            d_=first(TB_COLS["date"],gcol+1,n)
+            if d_ is not None: cm["date"]=d_
+            nt=first(TB_COLS["ntype"],gcol+1,n)
+            if nt is not None: cm["ntype"]=nt
+        need=[f for f in ("inv","igst","cgst","sgst","taxable") if f not in cm and not (role=="isd" and f in ("taxable",))]
+        nb=len(inv)+len(notes)+len(isd)
         for r in rows[hr+1:]:
             g=lambda f: (r[cm[f]] if f in cm and cm[f]<len(r) else None)
             gs=cgstin(g("gstin"))
@@ -1157,12 +1192,13 @@ def parse_2b_full(fb):
                  "rigst":0.0,"rcgst":0.0,"rsgst":0.0,
                  "rcm":str(g("rcm") or "").strip().lower().startswith("y"),"avail":str(g("avail") or "").strip(),"reason":str(g("reason") or "").strip(),
                  "period":str(g("period") or ""),"src":ws.title,"amend":role.endswith("_amd"),
-                 "ntype":("D" if "debit" in str(g("ntype") or "").lower() else "C") if "note" in role or role=="isd" else "",
+                 "ntype":(("D" if (role.startswith("dnote") or str(g("ntype") or "").strip().lower() in ("d","debit note","debit","dn","debit note (dn)")) else "C") if ("note" in role) else ("D" if role=="isd" and "debit" in str(g("ntype") or "").lower() else "C" if role=="isd" else "")),
                  "cancel":False,"vch":""}
             if role=="isd": isd.append(rec)
-            elif role.startswith("note"): notes.append(rec)
+            elif "note" in role: notes.append(rec)
             else: inv.append(rec)
-        layout.append({"sheet":ws.title,"role":{"inv":"Invoices","inv_amd":"Amended invoices (B2BA)","note":"Credit/Debit notes","note_amd":"Amended notes","isd":"ISD credit"}[role],
+        if need and len(inv)+len(notes)+len(isd)>nb: warns.append(f"2B sheet '{ws.title}': columns not found for {', '.join(need)} - check the header names; values for these will be zero.")
+        layout.append({"sheet":ws.title,"role":{"inv":"Invoices","inv_amd":"Amended invoices (B2BA)","note":"Credit/Debit notes","note_amd":"Amended notes","dnote":"Debit notes","dnote_amd":"Amended debit notes","isd":"ISD credit"}[role],
                        "header_row":hr+1,"rows":len(inv)+len(notes)+len(isd)-n0,"mapped":{k:str(hdr[v]).strip() for k,v in cm.items()}})
     for L in (inv,notes,isd):
         for r in L: r["inorm"]=inorm(r["inv"]); r["core"]=icore(r["inv"])
@@ -1373,6 +1409,8 @@ def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice"):
                 st="RCM - verify";pr=big(pg);rm=f"Supplier reports reverse charge (tax Rs.{_fmt(pg)}) - client must book self-invoice, pay tax in cash 3.1(d), then claim 4(A)(3). Not in books"
             elif str(p.get("avail","")).strip().lower().startswith("n"):
                 st="2B: ITC not available";pr="Low";rm="2B shows ITC NOT available"+(f": {p['reason']}" if p.get("reason") else "")+" - not in books, nothing to claim"
+            elif p.get("amend"):
+                st="Only in 2B";pr="Low";rm=f"B2BA amendment of earlier-period invoice '{p.get('oinv','')}' (revised GST Rs.{_fmt(pg)}): not new ITC - compare with the original period's books and claim / reverse only the DIFFERENCE"
             else:
                 st="Only in 2B";pr=big(pg);rm=f"Supplier filed (ITC Rs.{_fmt(pg)}) but not in books - book if goods/services received; check cut-off / other register / GSTIN typo in books"
         else:
@@ -1400,10 +1438,10 @@ def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice"):
                     st="Matched - Inv No differs"; pr="Low"; rm=f"Matched on {'GSTIN + numeric part of invoice no' if how=='core' else ('GSTIN + tax amount' if how=='amount' else 'invoice no + amount (GSTIN differs/typo)')}: Books '{r['B_Inv']}' vs 2B '{r['P_Inv']}'"
                     if how=="gstin_typo": st="Mismatch"; pr="Medium"; rm=f"GSTIN in books ({b.get('gstin') or 'blank'}) differs from 2B ({p.get('gstin')}) - correct supplier GSTIN in books"
                 elif small: pr="Low"; rm="Within rounding"
-                if P_rcm and b_rcm: st="RCM - verify";pr="Medium";rm="RCM booked correctly - confirm tax paid in 3.1(d) and ITC taken in 4(A)(3)"
+                if P_rcm and b_rcm: st="Matched - RCM";pr="Low";rm="RCM booked in RCM ledgers and agrees with 2B - confirm tax paid in cash in 3.1(d); ITC in 4(A)(3) only after payment"
                 if str(p.get("avail","")).strip().lower().startswith("n") and st.startswith("Matched"):
                     st="2B: ITC not available";pr="High";rm="Booked in books but 2B says ITC NOT available"+(f": {p['reason']}" if p.get("reason") else "")+" - do not claim"
-            if st in ("Matched","Matched - Inv No differs","Matched - Rounding","Mismatch") and not (str(p.get("avail","")).strip().lower().startswith("n")):
+            if st in ("Matched","Matched - Inv No differs","Matched - Rounding","Mismatch") and not P_rcm and not b_rcm and not (str(p.get("avail","")).strip().lower().startswith("n")):
                 r["elig"]=[min(r["B_IGST"],r["P_IGST"]),min(r["B_CGST"],r["P_CGST"]),min(r["B_SGST"],r["P_SGST"])]
         r["Status"]=st;r["Priority"]=pr;r["Remark"]=rm
         return r
@@ -1521,7 +1559,7 @@ def build_itc_excel_v2(res,client,period):
     cn=pt["notes"]; cnC=[r for r in cn if r["ntype"]!="D"]; cnD=[r for r in cn if r["ntype"]=="D"]
     s_=lambda L,h: float(sum(r[h] for r in L))
     isd=pt["isd"]; impg=float(sum(r["IGST"] for r in pt["imp"]))
-    rcm_rows=inv[(inv.Status=="RCM - verify")&inv.has_b]
+    rcm_rows=inv[inv.Status.isin(["RCM - verify","Matched - RCM"])&inv.has_b]
     lines=[("Eligible ITC on invoices (lower of Books & 2B)",[f"=SUM({RG('R')})",f"=SUM({RG('S')})",f"=SUM({RG('T')})"],"Only invoices present in BOTH books and 2B (Rule 36(4)), excl. ITC-not-available & RCM rows"),
            ("Less: credit notes on 2B",[-s_(cnC,"igst"),-s_(cnC,"cgst"),-s_(cnC,"sgst")],"Supplier credit notes - recipient must reduce ITC"),
            ("Add: debit notes on 2B",[s_(cnD,"igst"),s_(cnD,"cgst"),s_(cnD,"sgst")],"Supplier debit notes"),
@@ -1555,7 +1593,7 @@ def build_itc_excel_v2(res,client,period):
     q4=q3+max(len(nst),1)+2
     sm.cell(q4,1,"E. Key observations").font=Font(name="Calibri",bold=True,size=11,color=NAVY)
     vc=inv.Status.value_counts().to_dict(); obs=[]
-    ok=vc.get("Matched",0)+vc.get("Matched - Inv No differs",0)+vc.get("Matched - Rounding",0)
+    ok=vc.get("Matched",0)+vc.get("Matched - Inv No differs",0)+vc.get("Matched - Rounding",0)+vc.get("Matched - RCM",0)
     obs.append(f"{ok} of {len(inv)} invoice rows reconcile on GSTIN + number + tax.")
     for s,t in [("Mismatch","invoice(s) with tax / taxable / head / GSTIN differences - see Exceptions"),("Only in 2B","invoice(s) on 2B not booked - book before claiming ITC"),
                 ("Only in Books","invoice(s) booked but missing in 2B - ITC not claimable, reverse if already taken"),
@@ -1586,7 +1624,7 @@ def build_itc_excel_v2(res,client,period):
     if len(rc): acts.append(("MED",f"Verify {len(rc)} RCM item(s)","Self-invoice raised? tax paid in cash in 3.1(d)? ITC in 4(A)(3) only after payment",rc[["B_GST","P_GST"]].max(axis=1).sum(),"Sec 9(3)/9(4), 16"))
     if len(notes) and (notes.Status!="Matched").any(): acts.append(("MED","Credit/debit notes not reconciled","Supplier credit notes must reduce ITC; debit notes issued by client need supplier-side reporting",abs(notes.B_GST-notes.P_GST).sum(),"Sec 34(2)"))
     if len(pt["imp"]): acts.append(("LOW","Reconcile imports (IMPG) with Bills of Entry","IGST on imports is claimed from 2B IMPG; match to import ledger / customs duty entries",impg,"Sec 16, 3(7) CTA"))
-    acts.append(("OK",f"{ok} invoice(s) matched","Eligible after Sec 16(2)(a)-(d), 16(4), 17(5) checks",inv[inv.Status.str.startswith("Matched")].P_GST.sum(),"Sec 16"))
+    acts.append(("OK",f"{ok} invoice(s) matched","Eligible after Sec 16(2)(a)-(d), 16(4), 17(5) checks",inv[inv.Status.isin(["Matched","Matched - Inv No differs","Matched - Rounding"])].P_GST.sum(),"Sec 16"))
     pb={"HIGH":MIS,"MED":CUST_C,"LOW":ONLY2,"OK":MATCH}
     for i,it in enumerate(acts):
         x=4+i
@@ -1624,7 +1662,7 @@ def build_itc_excel_v2(res,client,period):
     ex=[]
     for df_,doc in ((inv,"Invoice"),(notes,"Note")):
         for r in df_.itertuples():
-            if r.Status in ("Matched","Matched - Inv No differs","Matched - Rounding","Nil-tax / cancelled in books"): continue
+            if r.Status in ("Matched","Matched - Inv No differs","Matched - Rounding","Matched - RCM","Nil-tax / cancelled in books"): continue
             ex.append((r.Priority,doc,r.Status,r.B_Inv or r.P_Inv,dv(r.Date),r.Party,r.GSTIN,r.B_GST,r.P_GST,r.Remark))
     po={"High":0,"Medium":1,"Low":2,"":3}; ex.sort(key=lambda t:(po.get(t[0],3),t[1],t[2]))
     for i,rw in enumerate(ex):
@@ -1712,8 +1750,9 @@ def build_itc_excel_v2(res,client,period):
 COLS3=["Taxable","IGST","CGST","SGST"]
 ROWS_3B=["3.1(a) Outward taxable (other than zero-rated, nil, exempt)","3.1(b) Outward zero-rated (exports / SEZ)","3.1(c) Other outward nil-rated / exempt",
          "3.1(d) Inward supplies liable to reverse charge","4(A)(1) Import of goods","4(A)(3) Inward supplies liable to RCM (ITC)","4(A)(4) Inward supplies from ISD",
-         "4(A)(5) All other ITC","4(B) ITC reversed (Rule 38/42/43 + others)","4(D) Ineligible ITC","4(C) Net ITC available (as per 3B)"]
+         "4(A)(5) All other ITC","4(B) ITC reversed (Rule 38/42/43 + others)","4(D) Ineligible ITC","4(C) Net ITC available (as per 3B)","4(A)(2) Import of services"]
 ROWS_G1=["Total taxable outward supplies - net of credit/debit notes (GSTR-1 Total Liability)","Of which: exports / SEZ with payment (zero-rated)","Nil-rated / exempt / non-GST (GSTR-1 Table 8)"]
+ROWS_EI=["E-invoice portal - B2B / SEZ / DE net of credit-debit notes"]
 ROWS_BK=["Sales register - taxable outward (net of credit notes)"]
 ROWS_2B=["2B: B2B invoices - ITC available (net of credit notes)","2B: Import of goods (IMPG)","2B: ISD credit","2B: Reverse-charge supplies (tax liability)","2B: ITC NOT available (info)"]
 ROWS_IB=["ITC reco: eligible ITC on invoices (lower of books & 2B) net of CN","ITC reco: RCM entries in books"]
@@ -1733,9 +1772,19 @@ def utilise(out,itc):
     u=min(s,I); s-=u; I-=u
     return (I,C,S),(i,c,s)
 
+def einv_net(pt):
+    """E-invoice portal totals (B2B/SEZ/DE net of credit/debit notes) from parse_portal output"""
+    df=zero_tbl(ROWS_EI); inv=pt["inv"]; nt=pt["notes"]
+    inv=inv[~inv["cancelled"]] if "cancelled" in inv else inv; nt=nt[~nt["cancelled"]] if (len(nt) and "cancelled" in nt) else nt
+    for c in COLS3:
+        v=float(inv[c].sum())
+        if len(nt): v+=sum((1 if str(t).upper().startswith("D") else -1)*x for t,x in zip(nt["ntype"],nt[c]))
+        df.loc[0,c]=v
+    return df
+
 def twob_refs(pt):
     """2B reference table from parse_2b_full output (ITC available only)"""
-    ok=lambda r: not str(r.get("avail","")).strip().lower().startswith("n") and not r.get("rcm")
+    ok=lambda r: not str(r.get("avail","")).strip().lower().startswith("n") and not r.get("rcm") and not r.get("amend")
     t={h:0.0 for h in ("taxable","igst","cgst","sgst")}
     inv_=[r for r in pt["inv"] if ok(r)]; cn=[r for r in pt["notes"] if ok(r)]
     b2b={h:sum(r[h] for r in inv_)-sum(r[h] for r in cn if r["ntype"]!="D")+sum(r[h] for r in cn if r["ntype"]=="D") for h in t}
@@ -1764,15 +1813,20 @@ def itc_reco_refs(res):
         if str(r.get("avail","")).lower().startswith("n") or r.get("rcm"): continue
         s=-1 if r["ntype"]!="D" else 1
         for k,h in enumerate(HEADS): cn[k]+=s*r[h]
-    rcm=inv[(inv.Status=="RCM - verify")&inv.has_b]
+    rcm=inv[inv.Status.isin(["RCM - verify","Matched - RCM"])&inv.has_b]
     return [e[k]+cn[k] for k in range(3)],[float(rcm.B_IGST.sum()),float(rcm.B_CGST.sum()),float(rcm.B_SGST.sum())]
 
-def run_3b_v2(t3b,tg1,tbk,t2b,tib,tol=2.0):
+def run_3b_v2(t3b,tg1,tbk,t2b,tib,tol=2.0,tei=None):
     R=[]   # dict rows
     def add(sec,desc,v3,ref,refname,kind,note=""):
         d=v3-ref; ok=abs(d)<=tol
-        if ok: st,rm="Match",""
-        elif kind=="out":
+        if kind=="info": ok=True; st,rm="Info",note
+        elif kind=="sub" and d>tol: ok=True; st,rm="OK (3B higher)",f"3B higher by Rs.{d:,.0f} - expected if there are B2C / other supplies not in e-invoice file"
+        elif ok: st,rm="Match",""
+        elif kind=="rcm" and d>tol: ok=True; st,rm="OK (3B higher)",f"3B higher by Rs.{d:,.0f} - expected if RCM also covers import of services / unregistered suppliers (not shown on 2B); verify the self-invoice working"
+        elif kind=="info": ok=True; st,rm="Info",note
+        elif kind=="sub": st,rm="3B LESS than "+refname,f"3B lower by Rs.{abs(d):,.0f} than e-invoice portal data (B2B subset of GSTR-1) - liability under-reported unless e-invoices are cancelled / belong to another period; confirm with GSTR-1 and pay with interest"
+        elif kind in ("out","rcm"):
             if d<0: st,rm="3B LESS than "+refname,f"Short payment Rs.{abs(d):,.0f} vs {refname} - pay with interest u/s 50 (18% p.a.) in next 3B; check amendments / DRC-03"
             else:   st,rm="3B MORE than "+refname,f"Excess Rs.{d:,.0f} - check advances, amendments / timing; refund or carry via next period if wrongly paid"
         elif kind=="itc":
@@ -1794,8 +1848,10 @@ def run_3b_v2(t3b,tg1,tbk,t2b,tib,tol=2.0):
     if tbk is not None and tbk[COLS3].abs().sum().sum()>0:
         for c in COLS3: add("A","3B vs Books - "+(c if c!="Taxable" else "Taxable value")+" (3.1(a)+(b))",a(ROWS_3B[0],c)+a(ROWS_3B[1],c),tget(tbk,ROWS_BK[0],c),"Books","out")
         for c in COLS3: add("A","GSTR-1 vs Books - "+c,tget(tg1,g_tot,c),tget(tbk,ROWS_BK[0],c),"Books","out","")
+    if tei is not None and tei[COLS3].abs().sum().sum()>0:
+        for c in COLS3: add("A",f"3B vs E-invoice portal - {c} (3.1(a)+(b))",a(ROWS_3B[0],c)+a(ROWS_3B[1],c),tget(tei,ROWS_EI[0],c),"E-invoice (B2B only)","sub")
     # B. RCM liability
-    for c in COLS3[1:]: add("B",f"RCM liability 3.1(d) {c} vs 2B reverse-charge supplies",a(ROWS_3B[3],c),tget(t2b,ROWS_2B[3],c),"2B RCM","gen","")
+    for c in COLS3[1:]: add("B",f"RCM liability 3.1(d) {c} vs 2B reverse-charge supplies",a(ROWS_3B[3],c),tget(t2b,ROWS_2B[3],c),"2B RCM","rcm","")
     # C. ITC
     add("C","4(A)(1) Import IGST",a(ROWS_3B[4],"IGST"),tget(t2b,ROWS_2B[1],"IGST"),"2B IMPG","itc")
     for c in COLS3[1:]: add("C",f"4(A)(4) ISD {c}",a(ROWS_3B[6],c),tget(t2b,ROWS_2B[2],c),"2B ISD","itc")
@@ -1803,9 +1859,11 @@ def run_3b_v2(t3b,tg1,tbk,t2b,tib,tol=2.0):
     if tib is not None:
         for c in COLS3[1:]: add("C",f"4(A)(5) {c} vs ITC-reco eligible (books∩2B)",a(ROWS_3B[7],c),tget(tib,ROWS_IB[0],c),"ITC reco","itc")
     for c in COLS3[1:]: add("C",f"4(A)(3) RCM ITC {c} vs RCM tax paid 3.1(d)",a(ROWS_3B[5],c),a(ROWS_3B[3],c),"3.1(d) payment","itc","")
+    for c in COLS3[1:]:
+        if abs(a(ROWS_3B[8],c))>tol: add("C",f"4(B) ITC reversed - {c} (as declared)",a(ROWS_3B[8],c),0.0,"-","info","Obtain the reversal working: Rule 42/43 (exempt / non-business use), 17(5), Rule 37 (180-day), 2B-differences or ITC on 2B notes - and tie to the books ledger")
     # D. arithmetic of 4(C)
     for c in COLS3[1:]:
-        calc=sum(a(ROWS_3B[k],c) for k in (4,5,6,7))-a(ROWS_3B[8],c)
+        calc=sum(a(ROWS_3B[k],c) for k in (4,5,6,7,11))-a(ROWS_3B[8],c)
         add("D",f"4(C) Net ITC {c} = 4(A) - 4(B)",a(ROWS_3B[10],c),calc,"3B arithmetic","gen","")
     df=pd.DataFrame(R)
     # utilisation
@@ -1815,7 +1873,7 @@ def run_3b_v2(t3b,tg1,tbk,t2b,tib,tol=2.0):
     util={"out":out,"rcm":rcm,"itc":itc,"cash":cash,"carry":carry}
     return df,util
 
-def build_3b_excel_v2(df,util,t3b,tg1,tbk,t2b,tib,client,period):
+def build_3b_excel_v2(df,util,t3b,tg1,tbk,t2b,tib,client,period,tei=None):
     wb=openpyxl.Workbook(); title,sub,head,widths=_xl_kit(wb)
     ws=wb.active; ws.title="3B Check"; ws.sheet_view.showGridLines=False
     H=["Sec","Description","3B (Filed)","Reference","Reference source","Diff (3B - Ref)","Status","Remark"]
@@ -1831,7 +1889,7 @@ def build_3b_excel_v2(df,util,t3b,tg1,tbk,t2b,tib,client,period):
             if not r.ok and ci in (6,7): c.fill=F(MIS); 
             if ci==7: c.font=Font(name="Calibri",bold=True,size=9,color="1E5631" if r.ok else "C00000")
         x+=1
-    x+=1; ws.merge_cells(start_row=x,start_column=1,end_row=x,end_column=8); c=ws.cell(x,1,"E. INDICATIVE TAX UTILISATION (Rule 88A order) - based on 3B output and 4(C) net ITC"); c.font=HF(10,NAVY); c.fill=F("E8EFF8"); x+=1
+    x+=1; ws.merge_cells(start_row=x,start_column=1,end_row=x,end_column=8); c=ws.cell(x,1,"E. INDICATIVE UTILISATION (Rule 88A order) - this month's ITC only; OPENING credit-ledger balance NOT considered, so actual cash may be lower"); c.font=HF(10,NAVY); c.fill=F("E8EFF8"); x+=1
     head(ws,x,["","","IGST","CGST","SGST","Total","",""]); x+=1
     for lab,v in (("Output tax 3.1(a)+(b)",util["out"]),("RCM tax (cash only) 3.1(d)",util["rcm"]),("Net ITC 4(C)",util["itc"]),("Cash payable on outward (indicative)",util["cash"]),("ITC carried forward (indicative)",util["carry"])):
         ws.cell(x,2,lab).font=DF(9,bold=True)
@@ -1839,7 +1897,7 @@ def build_3b_excel_v2(df,util,t3b,tg1,tbk,t2b,tib,client,period):
         c=ws.cell(x,6,f"=SUM(C{x}:E{x})"); c.number_format=INR; c.border=BD(); x+=1
     widths(ws,[6,52,16,16,18,16,32,90]); ws.freeze_panes="A5"
     wi=wb.create_sheet("Inputs used"); wi.sheet_view.showGridLines=False; title(wi,f"{client}  -  Values used in this check  |  {period}",5); r=3
-    for nm,t in (("GSTR-3B (filed) - typed",t3b),("GSTR-1 (filed) - typed",tg1),("Books sales (from Sales Reco / typed)",tbk),("GSTR-2B (from file)",t2b),("ITC Reco (from run / typed)",tib)):
+    for nm,t in (("GSTR-3B (filed)",t3b),("GSTR-1 (filed) - typed",tg1),("Books sales (from Sales Reco / typed)",tbk),("GSTR-2B (from file)",t2b),("ITC Reco (from run / typed)",tib),("E-invoice portal (B2B subset)",tei)):
         if t is None: continue
         wi.cell(r,1,nm).font=Font(name="Calibri",bold=True,size=11,color=NAVY); r+=1; head(wi,r,["Line"]+COLS3); r+=1
         for _,row in t.iterrows():
@@ -1849,6 +1907,77 @@ def build_3b_excel_v2(df,util,t3b,tg1,tbk,t2b,tib,client,period):
         r+=1
     widths(wi,[80,16,16,16,16])
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GSTR-3B (filed PDF from GST portal) → table values
+# ─────────────────────────────────────────────────────────────────────────────
+_NUM_RX=re.compile(r"(?<![\d.,])(\d[\d,]*\.\d{1,2}|(?<=\s)-(?=\s|$))")
+def _toks(txt):
+    out=[]
+    for m in _NUM_RX.finditer(txt):
+        t=m.group(1); out.append(0.0 if t=="-" else float(t.replace(",","")))
+    return out
+
+def parse_3b_pdf(fb):
+    """Read the filed GSTR-3B PDF (portal download). Returns (table DataFrame, meta dict, warnings)."""
+    import pdfplumber
+    with pdfplumber.open(io.BytesIO(fb)) as pdf:
+        text="\n".join((p.extract_text() or "") for p in pdf.pages)
+    warns=[]; meta={}
+    for k,rx in (("GSTIN",r"GSTIN of the supplier\s+([0-9A-Z]{15})"),("Legal name",r"Legal name of the registered person\s+(.+)"),("Year",r"Year\s+(\d{4}-\d{2})"),
+                 ("Period",r"Period\s+([A-Za-z]+)"),("ARN",r"ARN\s+([A-Z0-9]+)"),("ARN date",r"Date of ARN\s+([\d/]+)")):
+        m=re.search(rx,text); meta[k]=m.group(1).strip() if m else ""
+    if "3.1" not in text or "Eligible ITC" not in text:
+        raise ValueError("This does not look like a GSTR-3B PDF from the GST portal (Table 3.1 / Table 4 not found).")
+    def seg(a,b):
+        i=text.find(a); j=text.find(b,i+1) if i>=0 else -1
+        return text[i:j] if i>=0 and j>i else (text[i:] if i>=0 else "")
+    def rows_of(section,prefixes,ncols):
+        lines=[l.strip() for l in section.split("\n")]; res={}
+        starts=[]
+        for i,l in enumerate(lines):
+            for key,rx in prefixes.items():
+                if re.match(rx,l): starts.append((i,key)); break
+        for n,(i,key) in enumerate(starts):
+            end=starts[n+1][0] if n+1<len(starts) else min(len(lines),i+4)
+            blob=" ".join(lines[i:max(end,i+1)])
+            blob=re.sub(r"\(\d\)|\([a-eA-E]\)|\(c \)|rules 38,42 & 43|1 & 2|16\(4\)|17\(5\)|9\(5\)|4\(B\)\(2\)|section|Table","",blob)
+            t=_toks(blob); res[key]=t[:ncols]+[None]*(ncols-len(t[:ncols]))
+        return res
+    s31=seg("3.1 Details","3.1.1 Details")
+    r31=rows_of(s31,{"a":r"^\(a\)","b":r"^\(b\)","c":r"^\(c ?\)","d":r"^\(d\)","e":r"^\(e\)"},5)
+    s4=seg("4. Eligible ITC","5 Values")
+    iA=s4.find("A. ITC Available"); iB=s4.find("B. ITC Reversed"); iC=s4.find("C. Net ITC"); iD=s4.find("(D) Other Details")
+    secA=s4[iA:iB]; secB=s4[iB:iC]; secC=s4[iC:iD]; secD=s4[iD:]
+    rA=rows_of(secA,{"1":r"^\(1\)","2":r"^\(2\)","3":r"^\(3\)","4":r"^\(4\)","5":r"^\(5\)"},4)
+    rB=rows_of(secB,{"1":r"^\(1\)","2":r"^\(2\)"},4)
+    rC=_toks(" ".join(l for l in secC.split("\n")[:2]))[:4]
+    rD=rows_of(secD,{"1":r"^\(1\)","2":r"^\(2\)"},4)
+    z=lambda v,n: [0.0 if x is None else x for x in v]+[0.0]*(n-len(v))
+    bad=[]
+    def chk(name,vals):
+        if any(x is None for x in vals): bad.append(name)
+    for k,v in r31.items(): chk("3.1("+k+")",v)
+    for k,v in rA.items(): chk("4(A)("+k+")",v)
+    for k,v in rB.items(): chk("4(B)("+k+")",v)
+    t=zero_tbl(ROWS_3B)
+    def put(label,vals):   # vals = [taxable,I,C,S] or [I,C,S]
+        i=ROWS_3B.index(label)
+        for c,v in zip(COLS3,vals): t.loc[i,c]=v
+    g=lambda d,k,n: z(d.get(k,[0.0]*n),n)
+    a31=g(r31,"a",5); b31=g(r31,"b",5); c31=g(r31,"c",5); d31=g(r31,"d",5)
+    put(ROWS_3B[0],a31[:4]); put(ROWS_3B[1],b31[:4]); put(ROWS_3B[2],[c31[0],0,0,0]); put(ROWS_3B[3],d31[:4])
+    A={k:g(rA,k,4) for k in "12345"}
+    put(ROWS_3B[4],[0]+A["1"][:3]); put(ROWS_3B[5],[0]+A["3"][:3]); put(ROWS_3B[6],[0]+A["4"][:3]); put(ROWS_3B[7],[0]+A["5"][:3])
+    B1=g(rB,"1",4); B2=g(rB,"2",4); put(ROWS_3B[8],[0]+[B1[i]+B2[i] for i in range(3)])
+    D2=g(rD,"2",4); put(ROWS_3B[9],[0]+D2[:3]); put(ROWS_3B[10],[0]+z(rC,4)[:3]); put(ROWS_3B[11],[0]+A["2"][:3])
+    # self-check: 4(C) = 4(A) - 4(B)
+    for ci,h in enumerate(("IGST","CGST","SGST")):
+        calc=sum(A[k][ci] for k in "12345")-(B1[ci]+B2[ci]); got=z(rC,4)[ci]
+        if abs(calc-got)>1: bad.append(f"4(C) {h}: A-B={calc:,.2f} but PDF shows {got:,.2f}")
+    if bad: warns.append("PDF read check - please verify these lines against the PDF: "+"; ".join(bad))
+    meta["cess_outward"]=a31[4]
+    return t,meta,warns
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  UI
@@ -1938,7 +2067,7 @@ with tab1:
                     res,xb=st.session_state["itc_out"]; inv=res["inv"]; cnt=inv.Status.value_counts().to_dict()
                     st.success("✅ ITC Reconciliation complete!"); cols=st.columns(6)
                     for col,lbl,keys in zip(cols,["✅ Matched","⚠️ Mismatch","🟡 Only 2B","🔵 Only Books","⛔ ITC N/A on 2B","🟢 RCM"],
-                            [["Matched","Matched - Inv No differs","Matched - Rounding"],["Mismatch"],["Only in 2B"],["Only in Books"],["2B: ITC not available"],["RCM - verify"]]):
+                            [["Matched","Matched - Inv No differs","Matched - Rounding","Matched - RCM"],["Mismatch"],["Only in 2B"],["Only in Books"],["2B: ITC not available"],["RCM - verify"]]):
                         col.metric(lbl,sum(cnt.get(k,0) for k in keys))
                     el=sum(sum(x) for x in inv.elig) if len(inv) else 0
                     st.info(f"**Books ITC: ₹{inv.B_GST.sum():,.0f}** · 2B ITC: ₹{inv.P_GST.sum():,.0f} · **Eligible (lower of both): ₹{el:,.0f}** · Credit/debit notes: {len(res['notes'])} · IMPG: ₹{sum(r['IGST'] for r in res['pt']['imp']):,.0f}")
@@ -2047,7 +2176,13 @@ with tab3:
     elif st.session_state.get("itc_pt") is not None: pt3=st.session_state["itc_pt"]; src2b="2B from ITC tab"
     t2b_def=twob_refs(pt3) if pt3 else zero_tbl(ROWS_2B)
     sal=st.session_state.get("sal_out"); itcx=st.session_state.get("itc_out")
-    tbk_def=zero_tbl(ROWS_BK); tib_def=zero_tbl(ROWS_IB); srcs=[]
+    tbk_def=zero_tbl(ROWS_BK); tib_def=zero_tbl(ROWS_IB); tei_def=zero_tbl(ROWS_EI); srcs=[]
+    st.markdown("**Step 1b — E-invoice / GSTR-1 portal Excel** *(optional — gives a B2B outward reference before you type GSTR-1)*")
+    f_ei=st.file_uploader("E-invoice Excel",type=["xlsx","xls"],key="tb3_ei",label_visibility="collapsed")
+    if f_ei:
+        try: tei_def=einv_net(parse_portal(f_ei.getvalue())); srcs.append("e-invoice reference ← uploaded file")
+        except Exception as e: st.warning(f"Could not read e-invoice file: {e}")
+    elif sal: tei_def=einv_net(sal[0]["portal"]); srcs.append("e-invoice reference ← Sales Reco tab")
     if sal:
         bs=books_sales_net(sal[0]); 
         for c in COLS3: tbk_def.loc[0,c]=bs[c]
@@ -2058,11 +2193,11 @@ with tab3:
         srcs.append("ITC reference ← ITC Reco tab")
     if src2b: srcs.append(src2b)
     if srcs: st.caption("Auto-filled: "+" · ".join(srcs))
-    ssig=hashlib.md5((str(t2b_def.values.tolist())+str(tbk_def.values.tolist())+str(tib_def.values.tolist())).encode()).hexdigest()[:8]
+    ssig=hashlib.md5((str(t2b_def.values.tolist())+str(tbk_def.values.tolist())+str(tib_def.values.tolist())+str(tei_def.values.tolist())).encode()).hexdigest()[:8]
     cfg={c:st.column_config.NumberColumn(c,format="%.2f",step=1.0) for c in COLS3}
     st.markdown("---"); st.markdown("**Step 2 — GSTR-3B (filed) — type from the return**")
     e3b=st.data_editor(zero_tbl(ROWS_3B),hide_index=True,width="stretch",disabled=["Line"],column_config=cfg,key="e3b")
-    st.markdown("**Step 3 — GSTR-1 (filed)** — use *Total Liability* line of the GSTR-1 summary (net of credit/debit notes & amendments)")
+    st.markdown("**Step 3 — GSTR-1 (filed)** *(optional)* — type the *Total Liability* line of the GSTR-1 summary (net of notes & amendments); leave 0 to skip")
     eg1=st.data_editor(zero_tbl(ROWS_G1),hide_index=True,width="stretch",disabled=["Line"],column_config=cfg,key="eg1")
     with st.expander("References (auto-filled — edit if needed)",expanded=bool(srcs)):
         ebk=st.data_editor(tbk_def,hide_index=True,width="stretch",disabled=["Line"],column_config=cfg,key=f"ebk_{ssig}")
@@ -2072,8 +2207,10 @@ with tab3:
     if st.button("▶ Run 3B Check",type="primary",width="stretch",key="run_3b"):
         try:
             use_bk=ebk if ebk[COLS3].abs().sum().sum()>0 else None; use_ib=eib if eib[COLS3].abs().sum().sum()>0 else None
-            df3,util=run_3b_v2(e3b,eg1,use_bk,e2b,use_ib,tol3)
-            st.session_state["tb3_out"]=(df3,util,build_3b_excel_v2(df3,util,e3b,eg1,use_bk,e2b,use_ib,client,period).getvalue())
+            use_ei=eei if eei[COLS3].abs().sum().sum()>0 else None; use_g1=eg1 if eg1[COLS3].abs().sum().sum()>0 else None
+            df3,util=run_3b_v2(e3b,eg1,use_bk,e2b,use_ib,tol3,use_ei)
+            if use_g1 is None: df3=df3[~df3["Ref source"].eq("GSTR-1")].reset_index(drop=True)
+            st.session_state["tb3_out"]=(df3,util,build_3b_excel_v2(df3,util,e3b,use_g1,use_bk,e2b,use_ib,client,period,use_ei).getvalue())
         except Exception as e:
             st.session_state.pop("tb3_out",None); st.error(f"❌ {e}")
             with st.expander("Details"): import traceback; st.code(traceback.format_exc())
@@ -2083,11 +2220,11 @@ with tab3:
         else: st.success("✅ 3B agrees with all references")
         d=df3[["Section","Description","3B","Reference","Ref source","Diff","Status","Remark"]]
         st.dataframe(d,width="stretch",hide_index=True,height=420,column_config={k:st.column_config.NumberColumn(format="₹ %,.2f") for k in ["3B","Reference","Diff"]})
-        st.caption(f"Indicative cash payable on outward (IGST/CGST/SGST): ₹{util['cash'][0]:,.0f} / ₹{util['cash'][1]:,.0f} / ₹{util['cash'][2]:,.0f} · RCM tax payable in cash: ₹{sum(util['rcm']):,.0f}")
+        st.caption(f"Cash payable if only this month's ITC were available - opening credit-ledger balance not considered (IGST/CGST/SGST): ₹{util['cash'][0]:,.0f} / ₹{util['cash'][1]:,.0f} / ₹{util['cash'][2]:,.0f} · RCM tax payable in cash: ₹{sum(util['rcm']):,.0f}")
         st.download_button("⬇️ Download 3B Check Excel",data=xb,file_name=f"{client.replace(' ','_')}_3B_Check_{period.replace(' ','_')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",width="stretch")
     with st.expander("📋 Where to find the values"):
         st.markdown("""
-**GSTR-3B** — Returns → GSTR-3B → View filed return (PDF): Table 3.1 (a)(b)(c)(d), Table 4 (A)(B)(C)(D).
+**GSTR-3B** — Returns → GSTR-3B → Download filed PDF (read automatically).
 **GSTR-1** — Returns → GSTR-1 → View summary: *Total Liability* row, Table 8 nil/exempt, exports rows.
 **2B** — upload the Excel above (or run the ITC tab first). **Books sales** — run the Sales tab first. **ITC reference** — run the ITC tab first.
         """)
