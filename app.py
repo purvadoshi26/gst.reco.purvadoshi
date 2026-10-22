@@ -92,11 +92,14 @@ with tab1:
         st.markdown("**File 2 — Purchase Register (Tally / SAP / Excel)**")
         st.markdown('<div class="fmtbox"><b>Best:</b> flat export — one row per voucher with <code>Voucher No</code> · <code>Supplier Invoice No</code> · <code>GSTIN/UIN</code> · <code>Date</code> + purchase / Input IGST / CGST / SGST ledger columns (any order, any extra columns). Debit-note vouchers in the same file are picked up.<br><b>Also accepted:</b> older Tally sub-row layout · pivot summary (party-level only)</div>',unsafe_allow_html=True)
         f_pr=st.file_uploader("Purchase Register",type=["xlsx","xls"],key="itc_pr",label_visibility="collapsed")
+        st.markdown("**File 2b — Debit Note Register** *(optional — if exported as a separate file)*")
+        f_dn=st.file_uploader("Debit Note Register (optional)",type=["xlsx","xls"],key="itc_dn",label_visibility="collapsed")
     if f_2b and f_pr:
-        eb=f_2b.getvalue(); pbb=f_pr.getvalue(); sig=hashlib.md5(pbb+eb).hexdigest()[:10]; scan=None; pt=None
+        eb=f_2b.getvalue(); pbb=f_pr.getvalue(); dnb=f_dn.getvalue() if f_dn else None
+        sig=hashlib.md5(pbb+eb+(dnb or b"")).hexdigest()[:10]; scan=None; pt=None
         try:
             if st.session_state.get("itc_sig")!=sig:
-                st.session_state["itc_pt"]=parse_2b_full(eb); st.session_state["itc_scan"]=scan_pbooks_any(pbb)
+                st.session_state["itc_pt"]=parse_2b_full(eb); st.session_state["itc_scan"]=scan_pbooks_any(pbb,dn_fb=dnb)
                 st.session_state["itc_sig"]=sig; st.session_state.pop("itc_out",None); st.session_state.pop("itc_run",None)
             scan=st.session_state["itc_scan"]; pt=st.session_state["itc_pt"]
         except Exception as e:
@@ -105,6 +108,12 @@ with tab1:
         if scan is not None:
             pivot=(scan["kind"]=="legacy" and (scan["bw"]["_inv"].astype(str).str.strip()=="").all())
             if pt.get("meta"): st.caption("GSTR-2B file: "+_meta_line(pt["meta"]))
+            pdates=[d for d in scan["bw"]["_date"] if pd.notna(d) and hasattr(d, "year")]
+            if pdates and pt.get("meta",{}).get("pstart"):
+                min_pd, max_pd = min(pdates), max(pdates)
+                pst = pt["meta"]["pstart"]
+                if min_pd.year != pst.year or min_pd.month != pst.month:
+                    st.error(f"⛔ TAX PERIOD MISMATCH: Purchase vouchers are dated {min_pd:%d-%b-%Y} to {max_pd:%d-%b-%Y}, but GSTR-2B is for {pst:%b-%Y} ({pt['meta'].get('FY','')})! Please verify that your files are for the same tax period.")
             for w in scan["warns"]+pt["warns"]: st.warning(w)
             if pivot:
                 st.warning("Purchase file is a party-level pivot (no invoice numbers) → running the party-wise reco. Export the flat Purchase Register for invoice-wise matching.")
@@ -135,7 +144,7 @@ with tab1:
                     with st.spinner("Running invoice-wise ITC reco..."):
                         try:
                             lc=dict(zip(led_ed["Ledger column"],led_ed["Class"])); vc=dict(zip(vk,vt_ed["Treat as"]))
-                            res=run_itc_v2(pbb,eb,lc,vc,tol,mat,scan=scan,pt=pt)
+                            res=run_itc_v2(pbb,eb,lc,vc,tol,mat,scan=scan,pt=pt,dn_bytes=dnb)
                             st.session_state["itc_out"]=(res,build_itc_excel_v2(res,client,period).getvalue()); st.session_state["itc_run"]=_stamp(led_ed,vt_ed,tol,mat)
                         except Exception as e:
                             st.session_state.pop("itc_out",None); st.error(f"❌ {e}")
@@ -181,12 +190,15 @@ with tab2:
         st.markdown("**File 2 — Sales Register (Tally / SAP / Excel)**")
         st.markdown('<div class="fmtbox">Any company format — columns are found by <b>header name</b>, in any order.<br>Needs headers: <code>Voucher No / Invoice No</code> · <code>Date</code> · <code>GSTIN</code> · <code>Gross Total</code> (optional) + your sales / IGST / CGST / SGST ledger columns. Ledger columns are auto-classified — review below.</div>',unsafe_allow_html=True)
         f_sal=st.file_uploader("Sales Register",type=["xlsx","xls"],key="sal_bk",label_visibility="collapsed")
+        st.markdown("**File 2b — Credit Note Register** *(optional — if exported as a separate file)*")
+        f_cn=st.file_uploader("Credit Note Register (optional)",type=["xlsx","xls"],key="sal_cn",label_visibility="collapsed")
     if f_einv and f_sal:
-        eb=f_einv.getvalue(); bb=f_sal.getvalue(); sig=hashlib.md5(eb+bb).hexdigest()[:10]
+        eb=f_einv.getvalue(); bb=f_sal.getvalue(); cb=f_cn.getvalue() if f_cn else None
+        sig=hashlib.md5(eb+bb+(cb or b"")).hexdigest()[:10]
         scan=None
         try:
             if st.session_state.get("sal_sig")!=sig:
-                st.session_state["sal_scan"]=scan_books(bb); st.session_state["sal_sig"]=sig; st.session_state.pop("sal_out",None); st.session_state.pop("sal_run",None)
+                st.session_state["sal_scan"]=scan_books(bb,cn_fb=cb); st.session_state["sal_sig"]=sig; st.session_state.pop("sal_out",None); st.session_state.pop("sal_run",None)
             scan=st.session_state["sal_scan"]
         except Exception as e:
             st.error(f"❌ {e}")
@@ -195,6 +207,12 @@ with tab2:
             try:
                 _pm=parse_portal(eb).get("meta",{})
                 if _pm.get("GSTIN") or _pm.get("Period"): st.caption("E-invoice file: "+_meta_line(_pm))
+                bdates=[d for d in scan["bw"]["_date"] if pd.notna(d) and hasattr(d, "year")]
+                if bdates and _pm.get("pstart"):
+                    min_d, max_d = min(bdates), max(bdates)
+                    pst = _pm["pstart"]
+                    if min_d.year != pst.year or min_d.month != pst.month:
+                        st.error(f"⛔ TAX PERIOD MISMATCH: Books vouchers are dated {min_d:%d-%b-%Y} to {max_d:%d-%b-%Y}, but the E-Invoice Portal file is for {pst:%b-%Y} ({_pm.get('FY','')})! Comparing across different financial years will cause false mismatches. Please verify that your Books export matches the portal period.")
             except Exception: pass
             for w in scan["warns"]: st.warning(w)
             bw=scan["bw"]
@@ -214,7 +232,7 @@ with tab2:
                 with st.spinner("Running sales reco..."):
                     try:
                         lc=dict(zip(led_ed["Ledger column"],led_ed["Class"])); vc=dict(zip(vkeys,vt_ed["Treat as"]))
-                        res=run_sales_reco(eb,bb,lc,vc,tol,scan=scan)
+                        res=run_sales_reco(eb,bb,lc,vc,tol,scan=scan,cn_bytes=cb)
                         buf=build_sales_excel(res,client,period)
                         st.session_state["sal_out"]=(res,buf.getvalue()); st.session_state["sal_run"]=_stamp(led_ed,vt_ed,tol)
                     except Exception as e:
