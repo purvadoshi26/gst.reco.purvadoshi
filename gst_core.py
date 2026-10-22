@@ -581,9 +581,10 @@ def _find_hdr(rows,spec,required,min_hits=2,scan=40):
     return best
 
 # ── BOOKS: scan (layout + ledger guesses) ────────────────────────────────────
-def scan_books(fb):
-    wb=load_wb(fb); recs=[]; layout=[]; warns=[]
-    for ws in wb.worksheets:
+def scan_books(fb, cn_fb=None):
+    wb_list = [load_wb(fb)] + ([load_wb(cn_fb)] if cn_fb else [])
+    recs=[]; layout=[]; warns=[]
+    for ws in [w for wb in wb_list for w in wb.worksheets]:
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
         if not rows: continue
         hr,cm=_find_hdr(rows,BK_COLS,["inv"],2)
@@ -858,8 +859,8 @@ def reco_docs(b,p,tol,has_tax,doc="Invoice"):
     m["_n"]=[bi or pi for bi,pi in zip(m.B_Inv,m.P_Inv)]
     return m.sort_values(["_o","_d","_n"]).drop(columns=["_o","_d","_n","mrg","key"]).reset_index(drop=True)
 
-def _run_sales_reco_raw(portal_bytes,books_bytes,ledger_class=None,vtype_class=None,tol=1.0,scan=None):
-    scan=scan or scan_books(books_bytes)
+def _run_sales_reco_raw(portal_bytes,books_bytes,ledger_class=None,vtype_class=None,tol=1.0,scan=None,cn_bytes=None):
+    scan=scan or scan_books(books_bytes,cn_fb=cn_bytes)
     lc=dict(scan["ledger_guess"]); lc.update(ledger_class or {})
     vc=dict(scan["vtype_guess"]); vc.update(vtype_class or {})
     bk=build_books(scan["bw"],lc,vc); pt=parse_portal(portal_bytes)
@@ -1305,10 +1306,11 @@ def guess_pvtype(v):
     t=_hn(v)
     return "Credit/Debit Note" if re.search(r"debit note|dr\.? ?note|credit note|cr\.? ?note|purchase return|\bcn\b|\bdn\b|return",t) else "Invoice"
 
-def scan_pbooks(fb):
+def scan_pbooks(fb, dn_fb=None):
     """Header-driven flat purchase register. Returns None if no flat layout is found (→ legacy parsers)."""
-    wb=load_wb(fb); recs=[]; layout=[]; warns=[]
-    for ws in wb.worksheets:
+    wb_list = [load_wb(fb)] + ([load_wb(dn_fb)] if dn_fb else [])
+    recs=[]; layout=[]; warns=[]
+    for ws in [w for wb in wb_list for w in wb.worksheets]:
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
         if not rows: continue
         hr,cm=_find_hdr(rows,PB_COLS,[],3)
@@ -1360,8 +1362,8 @@ def scan_pbooks_legacy(fb):
             "layout":[{"sheet":"(legacy Tally layout)","header_row":0,"rows":len(recs),"mapped":{},"ledgers":["Input IGST","Input CGST","Input SGST"]}],
             "warns":["Purchase register is in the older Tally sub-row/pivot layout: taxable value is not available, so only tax is compared. A flat export (one row per voucher with Supplier Invoice No + GSTIN columns) gives a stronger reco."],"kind":"legacy"}
 
-def scan_pbooks_any(fb):
-    s=scan_pbooks(fb)
+def scan_pbooks_any(fb, dn_fb=None):
+    s=scan_pbooks(fb, dn_fb=dn_fb)
     if s is not None: return s
     try: return scan_pbooks_legacy(fb)
     except Exception as e: raise ValueError("Could not read the purchase register.\nNeeded headers: Date · Particulars · Voucher No · Supplier Invoice No · GSTIN/UIN · Input IGST / CGST / SGST ledger columns.\n("+str(e)[:120]+")")
@@ -1536,8 +1538,8 @@ def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice"):
     df["_d"]=[d if isinstance(d,datetime.date) else datetime.date(2100,1,1) for d in df.Date]
     return df.sort_values(["_o","Party","_d"]).drop(columns=["_o","_d"]).reset_index(drop=True)
 
-def run_itc_v2(pr_bytes,b2b_bytes,ledger_class=None,vtype_class=None,tol=1.0,mat=10000.0,scan=None,pt=None):
-    pt=pt or parse_2b_full(b2b_bytes); scan=scan or scan_pbooks_any(pr_bytes)
+def run_itc_v2(pr_bytes,b2b_bytes,ledger_class=None,vtype_class=None,tol=1.0,mat=10000.0,scan=None,pt=None,dn_bytes=None):
+    pt=pt or parse_2b_full(b2b_bytes); scan=scan or scan_pbooks_any(pr_bytes, dn_fb=dn_bytes)
     lc=dict(scan["ledger_guess"]); lc.update(ledger_class or {}); vc=dict(scan["vtype_guess"]); vc.update(vtype_class or {})
     d=build_pbooks(scan["bw"],lc,vc); rec=_recs_from_books(d)
     allp=pt["inv"]+pt["notes"]
@@ -2146,4 +2148,3 @@ def _pay_61(text):
     if len(ra)<3 or len(rb)<3: return None
     ordr=("Integrated","Central","State/UT")
     return {"A":[ra[x] for x in ordr],"B":[rb[x] for x in ordr]}
-
