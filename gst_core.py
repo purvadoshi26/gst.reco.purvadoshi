@@ -3,7 +3,7 @@ GST Audit Reconciliation Tool - CORE (parsing, matching, Excel output; no Stream
 Created by: Purva Doshi | linkedin.com/in/purvadoshi26
 Tabs: ITC Reco | Sales Reco | 3B vs GSTR-1 Check
 """
-import io, re, datetime, hashlib
+import io, re, datetime, hashlib, os
 import pandas as pd
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -61,6 +61,8 @@ def _xls_to_wb(fb):
     return wb
 
 def load_wb(fb):
+    if isinstance(fb, (str, os.PathLike)):
+        with open(fb, "rb") as f: fb = f.read()
     head=fb[:8]
     if head==b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":            # OLE2 container = real .xls
         try: return _xls_to_wb(fb)
@@ -88,7 +90,8 @@ def detect_pr_format(ws):
         rl=[str(v or "").strip().lower() for v in row]
         if "date" in rl and any(v in rl for v in ["particulars","party","vendor","supplier"]) and sum(1 for v in rl if v)>=4:
             for j in range(i+1,min(i+5,len(rows))):
-                if rows[j][0] and isinstance(rows[j][0],(_dt.datetime,_dt.date)): return "A",i
+                v0 = rows[j][0]
+                if v0 and (isinstance(v0,(_dt.datetime,_dt.date)) or to_date(v0) or str(v0).strip().lower() in ("educational","education")): return "A",i
     # FORMAT C: Pivot — strict "sum of input" check
     for i,row in enumerate(rows):
         vl=[str(v or "").lower() for v in row]
@@ -147,13 +150,13 @@ def parse_purchase(fb):
         if has_v:
             for row in rows[hr+1:]:
                 if not any(row): continue
-                dt=row[ci["date"]] if ci["date"] is not None and ci["date"]<len(row) else None
-                if not isinstance(dt,(datetime.datetime,datetime.date)): continue
+                dt=to_date(row[ci["date"]] if ci["date"] is not None and ci["date"]<len(row) else None)
                 p=str(row[ci["party"]] if ci["party"] is not None and ci["party"]<len(row) else "").strip()
                 if not p or p.lower() in ("grand total","total",""): continue
                 g=cgstin(row[ci["gstin"]]) if ci["gstin"] is not None and ci["gstin"]<len(row) else ""
                 vch=str(row[ci["vch"]] if ci["vch"] is not None and ci["vch"]<len(row) else "").strip()
                 sinv=str(row[ci["sinv"]] if ci["sinv"] is not None and ci["sinv"]<len(row) else "").strip()
+                if not (sinv or vch) and dt is None: continue
                 igst=sum(safe(row[c]) for c in igst_cols if c<len(row))
                 cgst=sum(safe(row[c]) for c in cgst_cols if c<len(row))
                 sgst=sum(safe(row[c]) for c in sgst_cols if c<len(row))
@@ -183,10 +186,10 @@ def parse_purchase(fb):
         if not any(row): continue
         r=[row[i] if i<len(row) else None for i in range(max(8,len(row)))]
         dt,part,vn,si,_,_,db,_=r[:8]
-        if isinstance(dt,(datetime.datetime,datetime.date)):
+        if isinstance(dt,(datetime.datetime,datetime.date)) or to_date(dt) or str(dt or "").strip().lower() in ("educational","education"):
             save_b(); p=str(part or "").strip()
             if not p or p.lower() in ("total","grand total"): cur={}; ig=cg=sg=0.; continue
-            cur={"d":dt,"p":p,"v":str(vn or ""),"si":str(si or ""),"g":""}; ig=cg=sg=0.
+            cur={"d":to_date(dt),"p":p,"v":str(vn or ""),"si":str(si or ""),"g":""}; ig=cg=sg=0.
         elif part and cur:
             lbl=str(part).upper(); amt=safe(db)
             if "IGST" in lbl and "CUSTOM" in lbl: cur["cust"]=cur.get("cust",0)+amt; ig+=amt
@@ -514,6 +517,8 @@ def to_date(v):
     if isinstance(v,(int,float)) and not isinstance(v,bool) and 30000<v<70000:
         return (datetime.datetime(1899,12,30)+datetime.timedelta(days=float(v))).date()
     t=str(v).strip()
+    if t.lower() in ("educational","education","edu","dummy","n/a","na","--","-","nil","none"):
+        return None
     if re.fullmatch(r"\d{5}(\.\d+)?",t) and 30000<float(t)<70000:        # Excel serial stored as text
         return (datetime.datetime(1899,12,30)+datetime.timedelta(days=float(t))).date()
     for fmt in ("%d-%b-%Y","%d-%b-%y","%d/%m/%Y","%d-%m-%Y","%d.%m.%Y","%Y-%m-%d","%d/%m/%y","%d-%m-%y","%d %b %Y","%Y-%m-%d %H:%M:%S","%d-%b-%Y %H:%M:%S"):
@@ -584,12 +589,28 @@ def _find_hdr(rows,spec,required,min_hits=2,scan=40):
 def scan_books(fb, cn_fb=None):
     wb_list = [load_wb(fb)] + ([load_wb(cn_fb)] if cn_fb else [])
     recs=[]; layout=[]; warns=[]
+    meta_comp = None; meta_gst = None; meta_per = None; edu_total = 0
     for ws in [w for wb in wb_list for w in wb.worksheets]:
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
         if not rows: continue
         hr,cm=_find_hdr(rows,BK_COLS,["inv"],2)
         if hr is None:
             warns.append(f"Sheet '{ws.title}' skipped: no header row containing a Voucher/Invoice No column."); continue
+        meta_company = None; meta_gstin = None; meta_period = None
+        for hr_row in rows[:hr]:
+            htext = " ".join(str(v).strip() for v in hr_row if v is not None)
+            if not htext: continue
+            if not meta_gstin:
+                mg = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z0-9][A-Z0-9]\b", htext)
+                if mg: meta_gstin = mg.group(0)
+            if not meta_period:
+                mp = re.search(r"\b\d{1,2}-[A-Za-z]{3}-\d{2,4}\s+to\s+\d{1,2}-[A-Za-z]{3}-\d{2,4}\b", htext, re.I)
+                if mp: meta_period = mp.group(0)
+            if not meta_company and not re.search(r"\d{1,2}-[A-Za-z]{3}", htext) and not any(k in htext.lower() for k in ("register", "date", "particulars", "gstin", "page", "voucher", "report", "pan :", "email :", "e-mail")):
+                meta_company = htext
+        if meta_company and not meta_comp: meta_comp = meta_company
+        if meta_gstin and not meta_gst: meta_gst = meta_gstin
+        if meta_period and not meta_per: meta_per = meta_period
         hdr=rows[hr]; data=rows[hr+1:]; used=set(cm.values()); lcols=[]; seen={}
         def colvals(ci): return [r[ci] if ci<len(r) else None for r in data]
         for ci,h in enumerate(hdr):
@@ -613,6 +634,8 @@ def scan_books(fb, cn_fb=None):
             if not inv: continue
             party=str(g("party") or "").strip()
             if party.lower() in ("total","grand total","sub total") or inv.lower() in ("total","grand total"): continue
+            d_raw = str(g("date") or "").strip().lower()
+            if d_raw in ("educational", "education"): edu_total += 1
             rec={"_sheet":ws.title,"_inv":inv,"_date":to_date(g("date")),"_party":party,"_gstin":cgstin(g("gstin")),
                  "_vtype":str(g("vtype") or "").strip(),"_gross":(abs(num(g("gross"))) if "gross" in cm else np.nan),"_narr":str(g("narr") or "")}
             for ci,name in lcols: rec[name]=num(r[ci]) if ci<len(r) else 0.0
@@ -623,8 +646,11 @@ def scan_books(fb, cn_fb=None):
     bw=pd.DataFrame(recs); led=[c for c in bw.columns if not c.startswith("_")]
     for c in led: bw[c]=pd.to_numeric(bw[c],errors="coerce").fillna(0.0)
     if not led: raise ValueError("No value/tax ledger columns detected in the books file (need numeric columns such as sales, IGST, CGST, SGST).")
+    if edu_total > 0:
+        warns.append(f"ℹ️ Tally Educational Mode detected: {edu_total} vouchers have 'Educational' date. Vouchers are matched on GSTIN, Invoice Number, and Tax amounts per GST standards.")
     return {"bw":bw,"ledger_guess":{c:guess_ledger_class(c) for c in led},
-            "vtype_guess":{v:guess_vtype(v) for v in bw["_vtype"].unique()},"layout":layout,"warns":warns}
+            "vtype_guess":{v:guess_vtype(v) for v in bw["_vtype"].unique()},"layout":layout,"warns":warns,
+            "meta":{"company":meta_comp,"gstin":meta_gst,"period":meta_per,"pstart":_pstart(meta_per,""),"edu_count":edu_total}}
 
 STD_RATES=[0,0.1,0.25,1,1.5,3,5,6,7.5,12,14,18,28,40]
 def build_books(bw,ledger_class,vtype_class):
@@ -675,13 +701,19 @@ HSN_COLS={"hsn":[r"^hsn"],"taxable":PT_COLS["taxable"],"igst":[r"^integrated tax
 
 _MONTHS={m:i+1 for i,m in enumerate(["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"])}
 def _pstart(period,fy):
-    """tax period ('April' / '042026' / 'Apr-2026') + financial year ('2026-27') -> first day of the period"""
+    """tax period ('April' / '042026' / 'Apr-2026' / '1-Apr-26 to 30-Apr-26') + financial year ('2026-27') -> first day of the period"""
     p=str(period or "").strip().lower(); fy=str(fy or "")
     try:
+        mr=re.search(r"\b\d{1,2}-([a-z]{3})-(\d{2,4})\b",p)
+        if mr:
+            m=_MONTHS.get(mr.group(1))
+            yr=int(mr.group(2))
+            if yr<100: yr+=2000
+            if m: return datetime.date(yr,m,1)
         if re.fullmatch(r"\d{6}",p): return datetime.date(int(p[2:]),int(p[:2]),1)
-        m=_MONTHS.get(p[:3]); 
+        m=_MONTHS.get(p[:3])
         if not m: return None
-        my=re.search(r"(20\d{2})",p); 
+        my=re.search(r"(20\d{2})",p)
         if my: return datetime.date(int(my.group(1)),m,1)
         y0=int(re.search(r"(20\d{2})",fy).group(1))
         return datetime.date(y0 if m>=4 else y0+1,m,1)
@@ -889,7 +921,9 @@ def _fix_notes(res):
         n.loc[m,"Remark"]="Books file has no credit/debit-note vouchers - provide Credit Note register to reconcile"
         n.loc[m,"Priority"]="Medium"
     return res
-def run_sales_reco(*a,**k): return _fix_notes(_run_sales_reco_raw(*a,**k))
+def run_sales_reco(*a,**k):
+    if "cn_fb" in k and "cn_bytes" not in k: k["cn_bytes"] = k.pop("cn_fb")
+    return _fix_notes(_run_sales_reco_raw(*a,**k))
 
 def build_sales_excel(res,client,period):
     wb=openpyxl.Workbook(); reco=res["reco"]; notes=res["notes"]; bk=res["books"]; pt=res["portal"]
@@ -1310,11 +1344,27 @@ def scan_pbooks(fb, dn_fb=None):
     """Header-driven flat purchase register. Returns None if no flat layout is found (→ legacy parsers)."""
     wb_list = [load_wb(fb)] + ([load_wb(dn_fb)] if dn_fb else [])
     recs=[]; layout=[]; warns=[]
+    meta_comp = None; meta_gst = None; meta_per = None; edu_total = 0
     for ws in [w for wb in wb_list for w in wb.worksheets]:
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
         if not rows: continue
         hr,cm=_find_hdr(rows,PB_COLS,[],3)
         if hr is None or not ("sinv" in cm or "vch" in cm) or "party" not in cm: continue
+        meta_company = None; meta_gstin = None; meta_period = None
+        for hr_row in rows[:hr]:
+            htext = " ".join(str(v).strip() for v in hr_row if v is not None)
+            if not htext: continue
+            if not meta_gstin:
+                mg = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z0-9][A-Z0-9]\b", htext)
+                if mg: meta_gstin = mg.group(0)
+            if not meta_period:
+                mp = re.search(r"\b\d{1,2}-[A-Za-z]{3}-\d{2,4}\s+to\s+\d{1,2}-[A-Za-z]{3}-\d{2,4}\b", htext, re.I)
+                if mp: meta_period = mp.group(0)
+            if not meta_company and not re.search(r"\d{1,2}-[A-Za-z]{3}", htext) and not any(k in htext.lower() for k in ("register", "date", "particulars", "gstin", "page", "voucher", "report", "pan :", "email :", "e-mail")):
+                meta_company = htext
+        if meta_company and not meta_comp: meta_comp = meta_company
+        if meta_gstin and not meta_gst: meta_gst = meta_gstin
+        if meta_period and not meta_per: meta_per = meta_period
         hdr=rows[hr]; data=rows[hr+1:]; used=set(cm.values()); lcols=[]; seen={}
         colv=lambda ci:[r[ci] if ci<len(r) else None for r in data]
         for ci,h in enumerate(hdr):
@@ -1328,13 +1378,13 @@ def scan_pbooks(fb, dn_fb=None):
         n0=len(recs)
         for r in data:
             g=lambda f:(r[cm[f]] if f in cm and cm[f]<len(r) else None)
-            if not isinstance(to_date(g("date")),datetime.date) and "date" in cm: 
-                if str(g("party") or "").strip().lower() not in ("(cancelled )","cancelled"): continue
             party=str(g("party") or "").strip()
             if party.lower() in ("total","grand total","sub total",""): continue
             sinv=str(g("sinv") if g("sinv") is not None else "").strip(); vch=str(g("vch") if g("vch") is not None else "").strip()
             key=sinv or vch
-            if not key: continue
+            if not key and party.lower() not in ("(cancelled )","cancelled"): continue
+            d_raw = str(g("date") or "").strip().lower()
+            if d_raw in ("educational", "education"): edu_total += 1
             rec={"_sheet":ws.title,"_inv":key,"_sinv":sinv,"_vch":vch,"_date":to_date(g("sdate")) or to_date(g("date")),"_bdate":to_date(g("date")),
                  "_party":party,"_gstin":cgstin(g("gstin")),"_vtype":str(g("vtype") or "").strip(),
                  "_gross":(abs(num(g("gross"))) if "gross" in cm else np.nan),"_narr":str(g("narr") or "")}
@@ -1345,7 +1395,10 @@ def scan_pbooks(fb, dn_fb=None):
     if not recs: return None
     bw=pd.DataFrame(recs); led=[c for c in bw.columns if not c.startswith("_")]
     for c in led: bw[c]=pd.to_numeric(bw[c],errors="coerce").fillna(0.0)
-    return {"bw":bw,"ledger_guess":{c:guess_pledger(c) for c in led},"vtype_guess":{v:guess_pvtype(v) for v in bw["_vtype"].unique()},"layout":layout,"warns":warns,"kind":"flat"}
+    if edu_total > 0:
+        warns.append(f"ℹ️ Tally Educational Mode detected: {edu_total} vouchers have 'Educational' date. Vouchers are matched on GSTIN, Invoice Number, and Tax amounts.")
+    return {"bw":bw,"ledger_guess":{c:guess_pledger(c) for c in led},"vtype_guess":{v:guess_pvtype(v) for v in bw["_vtype"].unique()},"layout":layout,"warns":warns,"kind":"flat",
+            "meta":{"company":meta_comp,"gstin":meta_gst,"period":meta_per,"pstart":_pstart(meta_per,""),"edu_count":edu_total}}
 
 def scan_pbooks_legacy(fb):
     """Tally sub-row / pivot formats via the original parser → invoice records (no taxable value)."""
