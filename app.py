@@ -108,12 +108,20 @@ with tab1:
         if scan is not None:
             pivot=(scan["kind"]=="legacy" and (scan["bw"]["_inv"].astype(str).str.strip()=="").all())
             if pt.get("meta"): st.caption("GSTR-2B file: "+_meta_line(pt["meta"]))
+            _bm = scan.get("meta", {})
+            if _bm.get("company"): st.caption(f"Books: {_bm['company']} · {_bm.get('period','')}")
             pdates=[d for d in scan["bw"]["_date"] if pd.notna(d) and hasattr(d, "year")]
-            if pdates and pt.get("meta",{}).get("pstart"):
+            pst = pt.get("meta",{}).get("pstart")
+            b_pstart = _bm.get("pstart")
+            edu_n = _bm.get("edu_count", 0)
+            if b_pstart and pst and (b_pstart.year != pst.year or b_pstart.month != pst.month):
+                st.error(f"⛔ TAX PERIOD MISMATCH: Books file indicates period '{_bm.get('period')}', but GSTR-2B is for {pst:%b-%Y} ({pt['meta'].get('FY','')})! Please verify that your files are for the same tax period.")
+            elif pdates and pst and edu_n == 0:
                 min_pd, max_pd = min(pdates), max(pdates)
-                pst = pt["meta"]["pstart"]
                 if min_pd.year != pst.year or min_pd.month != pst.month:
                     st.error(f"⛔ TAX PERIOD MISMATCH: Purchase vouchers are dated {min_pd:%d-%b-%Y} to {max_pd:%d-%b-%Y}, but GSTR-2B is for {pst:%b-%Y} ({pt['meta'].get('FY','')})! Please verify that your files are for the same tax period.")
+            if edu_n > 0:
+                st.info(f"ℹ️ Tally Educational Mode detected: {edu_n} vouchers have 'Educational' date. Vouchers are reconciled on GSTIN, Invoice Number, and Tax amounts.")
             for w in scan["warns"]+pt["warns"]: st.warning(w)
             if pivot:
                 st.warning("Purchase file is a party-level pivot (no invoice numbers) → running the party-wise reco. Export the flat Purchase Register for invoice-wise matching.")
@@ -145,7 +153,9 @@ with tab1:
                         try:
                             lc=dict(zip(led_ed["Ledger column"],led_ed["Class"])); vc=dict(zip(vk,vt_ed["Treat as"]))
                             res=run_itc_v2(pbb,eb,lc,vc,tol,mat,scan=scan,pt=pt,dn_bytes=dnb)
-                            st.session_state["itc_out"]=(res,build_itc_excel_v2(res,client,period).getvalue()); st.session_state["itc_run"]=_stamp(led_ed,vt_ed,tol,mat)
+                            rep_client = client if client != "Client" else (scan.get("meta",{}).get("company") or pt.get("meta",{}).get("Legal name") or "Client")
+                            rep_period = period if period != "Period" else (scan.get("meta",{}).get("period") or pt.get("meta",{}).get("Period") or "Period")
+                            st.session_state["itc_out"]=(res,build_itc_excel_v2(res,rep_client,rep_period).getvalue()); st.session_state["itc_run"]=_stamp(led_ed,vt_ed,tol,mat)
                         except Exception as e:
                             st.session_state.pop("itc_out",None); st.error(f"❌ {e}")
                             with st.expander("Details"): import traceback; st.code(traceback.format_exc())
@@ -207,12 +217,20 @@ with tab2:
             try:
                 _pm=parse_portal(eb).get("meta",{})
                 if _pm.get("GSTIN") or _pm.get("Period"): st.caption("E-invoice file: "+_meta_line(_pm))
+                _bm = scan.get("meta", {})
+                if _bm.get("company"): st.caption(f"Books: {_bm['company']} · {_bm.get('period','')}")
                 bdates=[d for d in scan["bw"]["_date"] if pd.notna(d) and hasattr(d, "year")]
-                if bdates and _pm.get("pstart"):
+                pst = _pm.get("pstart")
+                b_pstart = _bm.get("pstart")
+                edu_n = _bm.get("edu_count", 0)
+                if b_pstart and pst and (b_pstart.year != pst.year or b_pstart.month != pst.month):
+                    st.error(f"⛔ TAX PERIOD MISMATCH: Books file indicates period '{_bm.get('period')}', but the E-Invoice Portal file is for {pst:%b-%Y} ({_pm.get('FY','')})! Please verify that your Books export matches the portal period.")
+                elif bdates and pst and edu_n == 0:
                     min_d, max_d = min(bdates), max(bdates)
-                    pst = _pm["pstart"]
                     if min_d.year != pst.year or min_d.month != pst.month:
                         st.error(f"⛔ TAX PERIOD MISMATCH: Books vouchers are dated {min_d:%d-%b-%Y} to {max_d:%d-%b-%Y}, but the E-Invoice Portal file is for {pst:%b-%Y} ({_pm.get('FY','')})! Comparing across different financial years will cause false mismatches. Please verify that your Books export matches the portal period.")
+                if edu_n > 0:
+                    st.info(f"ℹ️ Tally Educational Mode detected: {edu_n} vouchers have 'Educational' date. Vouchers are reconciled on GSTIN, Invoice Number, and Tax amounts.")
             except Exception: pass
             for w in scan["warns"]: st.warning(w)
             bw=scan["bw"]
@@ -233,7 +251,9 @@ with tab2:
                     try:
                         lc=dict(zip(led_ed["Ledger column"],led_ed["Class"])); vc=dict(zip(vkeys,vt_ed["Treat as"]))
                         res=run_sales_reco(eb,bb,lc,vc,tol,scan=scan,cn_bytes=cb)
-                        buf=build_sales_excel(res,client,period)
+                        rep_client = client if client != "Client" else (scan.get("meta",{}).get("company") or _pm.get("Legal name") or "Client")
+                        rep_period = period if period != "Period" else (scan.get("meta",{}).get("period") or _pm.get("Period") or "Period")
+                        buf=build_sales_excel(res,rep_client,rep_period)
                         st.session_state["sal_out"]=(res,buf.getvalue()); st.session_state["sal_run"]=_stamp(led_ed,vt_ed,tol)
                     except Exception as e:
                         st.session_state.pop("sal_out",None); st.error(f"❌ {e}")
