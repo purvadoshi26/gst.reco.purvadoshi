@@ -537,7 +537,7 @@ BK_COLS={
  "date":  [r"^date$",r"^(invoice|bill|voucher|doc(ument)?)\.? ?date$"],
  "party": [r"^particulars$",r"^party( name)?$",r"^customer( name)?$",r"^buyer( name)?$",r"^name of (the )?(party|customer)$",r"^ledger( name)?$"],
  "vtype": [r"^voucher type$",r"^vch\.? type$",r"^doc(ument)? type$",r"^type$"],
- "inv":   [r"^voucher (no|number)\.?$",r"^invoice (no|number)\.?$",r"^inv\.? ?(no|number)\.?$",r"^bill (no|number)\.?$",r"^doc(ument)? (no|number)\.?$",r"^vch\.? ?no\.?$",r"^(voucher|invoice) ?(no|number)"],
+ "inv":   [r"^voucher (no|number)\.?$",r"^invoice (no|number)\.?$",r"^inv\.? ?(no|number)\.?$",r"^(voucher|vch|orig(inal)?)\.? ?ref(\.|\b) ?(no|number|num)?\.?$",r"^orig(inal)?\.? ?(inv(oice)?|bill)\.? ?(no|number|num)?\.?$",r"^bill (no|number)\.?$",r"^doc(ument)? (no|number)\.?$",r"^vch\.? ?no\.?$",r"^(voucher|invoice) ?(no|number)"],
  "gstin": [r"^gstin(/uin)?$",r"^gst ?(no|number|in)\.?$",r"^(customer|party|buyer|recipient) gstin(/uin)?$",r"gstin"],
  "gross": [r"^gross total$",r"^invoice (value|amount|total)$",r"^total( amount| value)?$",r"^bill (value|amount)$",r"^gross (amount|value)$",r"^grand total$"],
  "narr":  [r"^narration$",r"^remarks?$"],
@@ -646,7 +646,7 @@ def scan_books(fb, cn_fb=None):
     if not recs: raise ValueError("No voucher rows found in the books file.\nNeeded headers: Voucher No / Invoice No, Date, GSTIN, and value/tax ledger columns.")
     bw=pd.DataFrame(recs); led=[c for c in bw.columns if not c.startswith("_")]
     for c in led: bw[c]=pd.to_numeric(bw[c],errors="coerce").fillna(0.0)
-    bw,_nd=_dedupe_across_files(bw)
+    bw,_nd=_dedupe_across_files(bw, nmain=nmain)
     if _nd: warns.append(_dup_warn(_nd,"voucher(s)"))
     if not led: raise ValueError("No value/tax ledger columns detected in the books file (need numeric columns such as sales, IGST, CGST, SGST).")
     if edu_total > 0:
@@ -1331,6 +1331,17 @@ def parse_2b_full(fb):
     late=_late_docs(inv+notes,meta.get("pstart"))
     if late:
         warns.insert(0,"This 2B file is for "+str(meta.get("Period",""))+" but "+", ".join(f"{n} document(s) have GSTR-1 period {k}" for k,n in late.items())+" - another month's 2B looks pasted into it, so the portal ITC-summary check is skipped for this file. Upload each month's 2B as a SEPARATE file instead of merging.")
+    rej_sheets = [s for s in wb.sheetnames if any(x in s.lower() for x in ("rejected","reversal"))]
+    rej_docs = 0
+    for sn in rej_sheets:
+        try:
+            ws_r = wb[sn]
+            if ws_r.max_row and ws_r.max_row > 5:
+                for row in ws_r.iter_rows(min_row=6, max_col=3, values_only=True):
+                    if any(row): rej_docs += 1
+        except Exception: pass
+    if rej_docs > 0:
+        warns.append(f"ℹ️ IMS Dashboard: {rej_docs} document(s) in GSTR-2B were marked as REJECTED on the IMS portal - these are excluded from ITC availing.")
     try:
         summ=_2b_summary(wb)
         if not late: warns+=_check_2b_summary(summ,inv,notes,isd,imp)
@@ -1365,14 +1376,15 @@ def _books_meta(comp,gst,per,spans,edu):
     if len(sp)>1 and lo and hi: per=f"{lo:%b-%Y} to {hi:%b-%Y}"
     return {"company":comp,"gstin":gst,"period":per,"pstart":lo,"pend":hi,"edu_count":edu}
 
-def _dedupe_across_files(bw):
+def _dedupe_across_files(bw, nmain=None):
     """identical voucher (same no., date, party, GSTIN and amounts) found in TWO different uploaded files = overlapping exports -> keep one.
     Identical rows inside the SAME file are left alone (real double postings are for the auditor to see)."""
     if "_fidx" not in bw.columns or bw["_fidx"].nunique()<2: return bw,0
     led=[c for c in bw.columns if not c.startswith("_")]
     first={}; keep=[]
     for r in bw.to_dict("records"):
-        k=(str(r.get("_inv")),str(r.get("_date")),str(r.get("_party")).strip().lower(),str(r.get("_gstin")))+tuple(round(float(r[c] or 0),2) for c in led)
+        role = (r.get("_fidx", 0) >= nmain) if nmain is not None else 0
+        k=(role,str(r.get("_vtype")),str(r.get("_inv")),str(r.get("_date")),str(r.get("_party")).strip().lower(),str(r.get("_gstin")))+tuple(round(float(r[c] or 0),2) for c in led)
         f0=first.setdefault(k,r["_fidx"]); keep.append(f0==r["_fidx"])
     keep=pd.Series(keep,index=bw.index)
     return bw[keep].reset_index(drop=True),int((~keep).sum())
@@ -1500,8 +1512,8 @@ PB_COLS={
  "party":[r"^particulars$",r"^party( name)?$",r"^supplier( name)?$",r"^vendor( name)?$",r"^name of (the )?(party|supplier|vendor)$",r"^ledger( name)?$"],
  "vtype":[r"^voucher type$",r"^vch\.? type$",r"^doc(ument)? type$",r"^type$"],
  "vch":  [r"^voucher (no|number)\.?$",r"^vch\.? ?no\.?$",r"^doc(ument)? (no|number)\.?$"],
- "sinv": [r"^supplier inv(oice)?\.? ?(no|number|num)\.?$",r"^(party|vendor|bill|supplier) ?(bill|invoice|inv)\.? ?(no|number)\.?$",r"^ref(erence)?\.? ?(no|number)\.?$",r"^supplier ref",r"^invoice (no|number)\.?$",r"^bill (no|number)\.?$",r"^inv\.? ?(no|number)\.?$"],
- "sdate":[r"^supplier inv(oice)?\.? ?date$",r"^(party|vendor|bill|supplier) ?(bill|invoice|inv)\.? ?date$",r"^ref(erence)?\.? date$",r"^invoice date$",r"^bill date$"],
+ "sinv": [r"^supplier inv(oice)?\.? ?(no|number|num)\.?$",r"^(party|vendor|bill|supplier) ?(bill|invoice|inv)\.? ?(no|number)\.?$",r"^(voucher|vch|orig(inal)?)\.? ?ref(\.|\b) ?(no|number|num)?\.?$",r"^orig(inal)?\.? ?(inv(oice)?|bill)\.? ?(no|number|num)?\.?$",r"^ref(erence)?\.? ?(no|number)\.?$",r"^supplier ref",r"^invoice (no|number)\.?$",r"^bill (no|number)\.?$",r"^inv\.? ?(no|number)\.?$"],
+ "sdate":[r"^supplier inv(oice)?\.? ?date$",r"^(party|vendor|bill|supplier) ?(bill|invoice|inv)\.? ?date$",r"^(voucher|vch|orig(inal)?)\.? ?ref(\.|\b) ?date$",r"^orig(inal)?\.? ?(inv(oice)?|bill)\.? ?date$",r"^ref(erence)?\.? date$",r"^invoice date$",r"^bill date$"],
  "gstin":[r"^gstin(/uin)?$",r"^gst ?(no|number|in)\.?$",r"^(supplier|party|vendor) gstin(/uin)?$",r"gstin"],
  "gross":[r"^gross total$",r"^invoice (value|amount|total)\b",r"^total( amount| value)?$",r"^bill (value|amount)\b",r"^grand total$"],
  "narr": [r"^narration$",r"^remarks?$"],
@@ -1606,7 +1618,7 @@ def scan_pbooks(fb, dn_fb=None):
     if not recs: return None
     bw=pd.DataFrame(recs); led=[c for c in bw.columns if not c.startswith("_")]
     for c in led: bw[c]=pd.to_numeric(bw[c],errors="coerce").fillna(0.0)
-    bw,_nd=_dedupe_across_files(bw)
+    bw,_nd=_dedupe_across_files(bw, nmain=nmain)
     if _nd: warns.append(_dup_warn(_nd,"voucher(s)"))
     if edu_total > 0:
         warns.append(f"ℹ️ Tally Educational Mode detected: {edu_total} vouchers have 'Educational' date. Vouchers are matched on GSTIN, Invoice Number, and Tax amounts.")
@@ -1757,7 +1769,7 @@ def match_itc(B,P):
     tier(lambda r:(r["gstin"],round(_ttax(r))) if r["gstin"] and _ttax(r)>0 else None, lambda r:(r["gstin"],round(_ttax(r))) if _ttax(r)>0 else None,"amount")
     ktt=lambda r:(r["gstin"],round(_ttax(r))) if r["gstin"] and _ttax(r)>0 else None
     gtier(ktt,ktt,"amt_grp")
-    tier(lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None, lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None,"gstin_typo",lambda b,p:_gstin_close(b["gstin"],p["gstin"]) or _name_close(b.get("party"),p.get("party")))
+    tier(lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None, lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None,"gstin_typo",lambda b,p:_gstin_close(b["gstin"],p["gstin"]))
     kng=lambda r:(round(r.get("taxable",0.0)),round(_ttax(r))) if r.get("taxable",0.0)>0 and _ttax(r)>0 else None
     tier(kng,kng,"gstin_typo",lambda b,p:_gstin_close(b["gstin"],p["gstin"]))
     tier(lambda r:r["inorm"] if len(r["inorm"])>=4 else None, lambda r:r["inorm"] if len(r["inorm"])>=4 else None,"inv_only",
@@ -1803,7 +1815,12 @@ def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice",bmin=None):
             elif bmin and p.get("date") and p["date"]<bmin:
                 stat="Only in 2B";pr="Low";rm=f"Invoice dated {p['date']:%d-%b-%y} is BEFORE this register starts ({bmin:%d-%b-%y}) - probably booked in an earlier month's register (ITC Rs.{_fmt(pg)}); check there before treating as unbooked"
             else:
-                stat="Only in 2B";pr=big(pg);rm=f"Supplier filed (ITC Rs.{_fmt(pg)}) but not in books - book if goods/services received; check cut-off / other register / GSTIN typo in books"
+                is_bank = bool(re.search(r"\b(bank|co-?operative bank)\b", str(p.get("party") or "").lower()))
+                stat="Only in 2B";pr=big(pg)
+                if is_bank:
+                    rm=f"Bank charges (ITC Rs.{_fmt(pg)}) on 2B - typically booked via Bank Payment vouchers in Tally without purchase invoice; verify if claimed in 3B 4(A)(5)"
+                else:
+                    rm=f"Supplier filed (ITC Rs.{_fmt(pg)}) but not in books - book if goods/services received; check cut-off / other register / GSTIN typo in books"
         else:
             iss=[];bigdiff=False;over=False
             ndiff=[(h.upper(),r["B_"+h.upper()]-r["P_"+h.upper()]) for h in HEADS]
@@ -2002,6 +2019,10 @@ def build_itc_excel_v2(res,client,period):
             amt=inv[inv.Status==s]; obs.append(f"{vc[s]} {t} (Books GST Rs.{amt.B_GST.sum():,.0f} / 2B GST Rs.{amt.P_GST.sum():,.0f}).")
     hd=inv[inv.Priority=="High"]
     if len(hd): obs.append(f"{len(hd)} HIGH-priority row(s) (>= Rs.{res['mat']:,.0f} or ITC-risk items).")
+    bank_docs=inv[(inv.Status=="Only in 2B") & inv.Party.str.contains(r"\b(bank|co-?operative bank)\b", case=False, na=False)]
+    if len(bank_docs):
+        b_gst=bank_docs.P_GST.sum(); b_parties=", ".join(sorted(bank_docs.Party.unique())[:2])
+        obs.append(f"{len(bank_docs)} bank charges document(s) on 2B (tax Rs.{b_gst:,.0f}) from {b_parties} - in Tally, bank charges are typically posted via Bank Payment vouchers rather than the Purchase Register; verify payment entries to confirm ITC claim.")
     if len(pt["imp"]): obs.append(f"IMPG: {len(pt['imp'])} Bill(s) of Entry, IGST Rs.{impg:,.0f} - reconcile with import / custom-duty ledger.")
     for w in res["warns"]: obs.append("WARNING: "+w)
     for i,t in enumerate(obs):
@@ -2126,8 +2147,17 @@ def build_itc_excel_v2(res,client,period):
         row_(["Gross total = value + tax (per voucher)",f"{len(chk)-len(fail)} of {len(chk)} pass","OK" if not len(fail) else "Check ledger classes: "+"; ".join(fail._inv.astype(str).head(6))])
     if res["filled"]:
         r[0]+=1; block("6. GSTIN inferred from party name - please verify"); row_(["Party","Inferred GSTIN","Basis"],True)
+        tally_fixes={}
         for x in (res["rec"]["Invoice"]+res["rec"]["Credit/Debit Note"]):
-            if x.get("gstin_src"): row_([x["party"],x["gstin"],x["gstin_src"]])
+            if x.get("gstin_src"):
+                p=x.get("party") or ""; g=x.get("gstin") or ""; src=x.get("gstin_src")
+                row_([p,g,src])
+                if p and p not in tally_fixes:
+                    tally_fixes[p]=(p, f"Blank in Tally; set to {g} ({src})")
+        if tally_fixes:
+            r[0]+=1; block("7. Tally Master GSTIN Corrections (Action required in Tally Ledgers)"); row_(["Party / Ledger Name","Recommended Action in Tally"],True)
+            for p, act in sorted(tally_fixes.values()):
+                row_([p, act])
     if res["warns"]:
         r[0]+=1; block("Warnings")
         for w in res["warns"]: row_([w])
