@@ -102,6 +102,21 @@ def _chk_period(books_lbl,portal_lbl,dates,bmeta,pmeta,edu_n=0):
 def _stamp(*objs):
     return hashlib.md5("|".join(repr(getattr(o,"values",o).tolist() if hasattr(getattr(o,"values",None),"tolist") else o) for o in objs).encode()).hexdigest()[:10]
 
+def _recv_line(*groups):
+    """One line showing what the app has ACTUALLY received from each uploader: (label, files, optional).
+    If the browser lists a file above but this line says 'not received yet', the upload never reached the
+    server - remove it (x) and add it again."""
+    parts=[]
+    for lbl,files,opt in groups:
+        n=len(files or [])
+        parts.append(f"{'✅' if n else ('➖' if opt else '⬜')} **{lbl}**: "+(f"{n} file{'s' if n!=1 else ''}" if n else ("none (optional)" if opt else "not received yet")))
+    st.caption("Received by the app → "+"  ·  ".join(parts))
+def _locked_run(label,key,need):
+    """Run button that is ALWAYS on screen: greyed out until the required files have been received and read."""
+    st.info(f"Add {need} above - the Run button unlocks as soon as they are received and read. "
+            "If a file is listed in the box above but shows 'not received yet' here, the upload did not reach the app: click ✕ on it and add it again (or refresh the page).")
+    st.button(label,type="primary",width="stretch",key=key,disabled=True,help="Unlocks when the required files are uploaded.")
+
 # ── TAB 1: ITC (invoice-wise) ─────────────────────────────────────────────────
 with tab1:
     st.markdown("### GSTR-2B vs Purchase Register — invoice-wise ITC reco")
@@ -116,17 +131,26 @@ with tab1:
         f_pr=st.file_uploader("Purchase Register",type=["xlsx","xls"],key="itc_pr",label_visibility="collapsed",accept_multiple_files=True)
         st.markdown("**File 2b — Debit Note Register(s)** *(optional — one or more files, if exported separately)*")
         f_dn=st.file_uploader("Debit Note Register (optional)",type=["xlsx","xls"],key="itc_dn",label_visibility="collapsed",accept_multiple_files=True)
+    _recv_line(("GSTR-2B",f_2b,False),("Purchase Register",f_pr,False),("Debit notes",f_dn,True))
+    _gate=st.empty()      # one fixed slot: locked Run button / 'reading files' state - replaced as a whole, so nothing stale is left behind
     if f_2b and f_pr:
         eb=_ups(f_2b); pbb=_ups(f_pr); dnb=_ups(f_dn) or None
         sig=_sig(pbb,eb,dnb or []); scan=None; pt=None
         try:
             if st.session_state.get("itc_sig")!=sig:
-                st.session_state["itc_pt"]=parse_2b_multi(eb); st.session_state["itc_scan"]=scan_pbooks_any(pbb,dn_fb=dnb)
+                with _gate.container():
+                    st.button("▶ Run ITC Reconciliation",type="primary",width="stretch",key="run_itc_wait",disabled=True)
+                    with st.spinner("⏳ Reading the uploaded files... the Run button unlocks as soon as this finishes"):
+                        s2b=_sig(eb); sbk=_sig(pbb,dnb or [])      # parse each side only when ITS files changed (adding a debit-note file no longer re-reads the 2B)
+                        if st.session_state.get("itc_s2b")!=s2b: st.session_state["itc_pt"]=parse_2b_multi(eb); st.session_state["itc_s2b"]=s2b
+                        if st.session_state.get("itc_sbk")!=sbk: st.session_state["itc_scan"]=scan_pbooks_any(pbb,dn_fb=dnb); st.session_state["itc_sbk"]=sbk
                 st.session_state["itc_sig"]=sig; st.session_state.pop("itc_out",None); st.session_state.pop("itc_run",None)
             scan=st.session_state["itc_scan"]; pt=st.session_state["itc_pt"]
         except Exception as e:
+            st.session_state.pop("itc_sig",None)      # never leave half-updated results marked as current
             st.error(f"❌ {e}")
             with st.expander("Details"): import traceback; st.code(traceback.format_exc())
+        _gate.empty()      # files are read -> the locked placeholder makes way for the real Run button below
         if scan is not None:
             pivot=(scan["kind"]=="legacy" and (scan["bw"]["_inv"].astype(str).str.strip()=="").all())
             if pt.get("meta"): st.caption(f"GSTR-2B ({len(pt['parts'])} file{'s' if len(pt['parts'])>1 else ''}): "+_meta_line(pt["meta"]))
@@ -206,7 +230,7 @@ with tab1:
                     st.download_button("⬇️ Download ITC Reco Excel",data=xb,file_name=f"{client.replace(' ','_')}_ITC_Reco_{period.replace(' ','_')}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",width="stretch")
                     st.caption("Excel: Summary · Auditor Actions · Invoice Reco · Credit-Debit Notes · Party Summary · Exceptions · IMPG & ISD · Mapping & Checks · Legend")
     else:
-        st.info("Upload both files above to run.")
+        with _gate.container(): _locked_run("▶ Run ITC Reconciliation","run_itc_locked","the **GSTR-2B file(s)** and the **Purchase Register**")
 
 # ── TAB 2: SALES ──────────────────────────────────────────────────────────────
 with tab2:
@@ -222,17 +246,27 @@ with tab2:
         f_sal=st.file_uploader("Sales Register",type=["xlsx","xls"],key="sal_bk",label_visibility="collapsed",accept_multiple_files=True)
         st.markdown("**File 2b — Credit Note Register(s)** *(optional — one or more files, if exported separately)*")
         f_cn=st.file_uploader("Credit Note Register (optional)",type=["xlsx","xls"],key="sal_cn",label_visibility="collapsed",accept_multiple_files=True)
+    _recv_line(("E-invoice / GSTR-1",f_einv,False),("Sales Register",f_sal,False),("Credit notes",f_cn,True))
+    _gate=st.empty()
     if f_einv and f_sal:
         eb=_ups(f_einv); bb=_ups(f_sal); cb=_ups(f_cn) or None
         sig=_sig(eb,bb,cb or [])
         scan=None
         try:
             if st.session_state.get("sal_sig")!=sig:
-                st.session_state["sal_scan"]=scan_books(bb,cn_fb=cb); st.session_state["sal_pt"]=parse_portal_multi(eb); st.session_state["sal_sig"]=sig; st.session_state.pop("sal_out",None); st.session_state.pop("sal_run",None)
+                with _gate.container():
+                    st.button("▶ Run Sales Reconciliation",type="primary",width="stretch",key="run_sal_wait",disabled=True)
+                    with st.spinner("⏳ Reading the uploaded files... the Run button unlocks as soon as this finishes"):
+                        sbk=_sig(bb,cb or []); spt=_sig(eb)        # parse each side only when ITS files changed
+                        if st.session_state.get("sal_sbk")!=sbk: st.session_state["sal_scan"]=scan_books(bb,cn_fb=cb); st.session_state["sal_sbk"]=sbk
+                        if st.session_state.get("sal_spt")!=spt: st.session_state["sal_pt"]=parse_portal_multi(eb); st.session_state["sal_spt"]=spt
+                st.session_state["sal_sig"]=sig; st.session_state.pop("sal_out",None); st.session_state.pop("sal_run",None)
             scan=st.session_state["sal_scan"]
         except Exception as e:
+            st.session_state.pop("sal_sig",None)
             st.error(f"❌ {e}")
             with st.expander("Details"): import traceback; st.code(traceback.format_exc())
+        _gate.empty()
         if scan:
             try:
                 ptl=st.session_state["sal_pt"]; _pm=ptl.get("meta",{})
@@ -300,7 +334,7 @@ with tab2:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",width="stretch")
                 st.caption("Excel: Summary · Invoice Reco · Credit-Debit Notes · Exceptions · Mapping & Checks")
     else:
-        st.info("Upload both files above to run.")
+        with _gate.container(): _locked_run("▶ Run Sales Reconciliation","run_sal_locked","the **E-invoice / GSTR-1 file(s)** and the **Sales Register**")
 
 # ── TAB 3: 3B CHECK (v2) ──────────────────────────────────────────────────────
 with tab3:
@@ -409,4 +443,4 @@ with tab3:
         """)
 
 st.markdown("---")
-st.markdown('<div style="text-align:center;font-size:.74rem;color:#888">GST Audit Reconciliation Tool · Built by <a href="https://linkedin.com/in/purvadoshi26" style="color:#5585B5">Purva Doshi</a> · build 2026-11-19 r4 · multi-month upload</div>',unsafe_allow_html=True)
+st.markdown('<div style="text-align:center;font-size:.74rem;color:#888">GST Audit Reconciliation Tool · Built by <a href="https://linkedin.com/in/purvadoshi26" style="color:#5585B5">Purva Doshi</a> · build 2026-11-19 r5 · always-on Run button</div>',unsafe_allow_html=True)
