@@ -595,6 +595,7 @@ def scan_books(fb, cn_fb=None):
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
         if not rows: continue
         hr,cm=_find_hdr(rows,BK_COLS,["inv"],2)
+        if hr is None: hr,cm=_find_hdr(rows,BK_COLS,["date","party"],2)
         if hr is None:
             warns.append(f"Sheet '{ws.title}' skipped: no header row containing a Voucher/Invoice No column."); continue
         meta_company = None; meta_gstin = None; meta_period = None
@@ -628,13 +629,20 @@ def scan_books(fb, cn_fb=None):
                 if ci in used or not re.fullmatch(r"(taxable )?value|taxable( amount)?|basic( value| amount)?|amount|assessable value|net amount",hs): continue
                 if any(is_num(v) and num(v)!=0 for v in colvals(ci)):
                     lcols.append((ci,ws.title.strip() if hs in("value","amount") else str(h).strip())); break
+        all_inv_blank = ("inv" not in cm) or (not any(str(r[cm["inv"]] if cm["inv"]<len(r) and r[cm["inv"]] is not None else "").strip() for r in data))
+        if all_inv_blank:
+            noinv_any = True
+            warns.append(f"Sheet '{ws.title}': no Voucher/Invoice numbers found in the '{hdr[cm.get('inv', 0)] if 'inv' in cm else 'Voucher No'}' column - vouchers are matched on GSTIN + taxable value + tax amount.")
         n0=len(recs)
-        for r in data:
+        for ri,r in enumerate(data):
             g=lambda f: (r[cm[f]] if f in cm and cm[f]<len(r) else None)
-            inv=str(g("inv") if g("inv") is not None else "").strip()
-            if not inv: continue
             party=str(g("party") or "").strip()
-            if party.lower() in ("total","grand total","sub total") or inv.lower() in ("total","grand total"): continue
+            if not party or party.lower() in ("total","grand total","sub total"): continue
+            inv=str(g("inv") if g("inv") is not None else "").strip()
+            if not inv:
+                if all_inv_blank: inv=f"NOINV_{fi}_{ri+1}"
+                else: continue
+            if inv.lower() in ("total","grand total"): continue
             d_raw = str(g("date") or "").strip().lower()
             if d_raw in ("educational", "education"): edu_total += 1
             rec={"_sheet":ws.title,"_file":fname,"_fidx":fi,"_inv":inv,"_date":to_date(g("date")),"_party":party,"_gstin":cgstin(g("gstin")),
@@ -2244,13 +2252,18 @@ def _ym_mask(df,months):
     return pd.Series([bool(isinstance(d,datetime.date) and (d.year,d.month) in months) for d in df["_date"]],index=df.index)
 
 def books_sales_net(res,months=None):
-    bk=res["books"]; inv=bk["inv"]; nt=bk["notes"]
-    inv=inv[_ym_mask(inv,months)]; nt=nt[_ym_mask(nt,months)]
-    out={c:float(inv[c].sum()) for c in COLS3}
-    if len(nt):
+    bk=res["books"]; inv=bk.get("inv"); nt=bk.get("notes")
+    out={c:0.0 for c in COLS3}
+    if inv is not None and len(inv):
+        inv=inv[_ym_mask(inv,months)]
         for c in COLS3:
-            sgn=sum((1 if "debit" in str(v).lower() else -1)*abs(x) for v,x in zip(nt["_vtype"],nt[c]))
-            out[c]+=sgn
+            if c in inv.columns: out[c]+=float(inv[c].sum())
+    if nt is not None and len(nt):
+        nt=nt[_ym_mask(nt,months)]
+        for c in COLS3:
+            if c in nt.columns:
+                sgn=sum((1 if "debit" in str(v).lower() else -1)*abs(x) for v,x in zip(nt.get("_vtype",["Credit Note"]*len(nt)),nt[c]))
+                out[c]+=sgn
     return out
 
 def itc_reco_refs(res,files=None,months=None):
