@@ -1330,7 +1330,8 @@ def guess_pledger(h):
         if re.search(r"\bigst\b|integrated",t): return "RCM IGST"
         if re.search(r"\bcgst\b|central",t): return "RCM CGST"
         if re.search(r"\bsgst\b|\butgst\b|state",t): return "RCM SGST"
-    if re.search(r"round(ing)?[ -]?(off|up|down)?\b|\btcs\b|\btds\b|freight (paid|payable)",t) and not re.search(r"purchase",t): return "Other"
+    if re.search(r"round(ing)?[ -]?(off|up|down)?\b",t): return "Other"
+    if re.search(r"\btcs\b|\btds\b|freight (paid|payable)",t) and not re.search(r"purchase",t): return "Other"
     if re.search(r"\bcess\b",t): return "Cess"
     if re.search(r"\bigst\b|integrated (gst|tax)",t): return "IGST" if not re.search(_VAL_KW.replace("sale|sales|",""),t) or re.search(r"input|credit|itc|paid",t) else "Taxable"
     if re.search(r"\bcgst\b|central (gst|tax)",t): return "CGST" if not re.search(_VAL_KW.replace("sale|sales|",""),t) or re.search(r"input|credit|itc|paid",t) else "Taxable"
@@ -1357,7 +1358,7 @@ def _guess_party_col(data,used,sample=200):
 def scan_pbooks(fb, dn_fb=None):
     """Header-driven flat purchase register. Returns None if no flat layout is found (→ legacy parsers)."""
     wb_list = [load_wb(fb)] + ([load_wb(dn_fb)] if dn_fb else [])
-    recs=[]; layout=[]; warns=[]
+    recs=[]; layout=[]; warns=[]; noinv_any=False
     meta_comp = None; meta_gst = None; meta_per = None; edu_total = 0
     for ws in [w for wb in wb_list for w in wb.worksheets]:
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
