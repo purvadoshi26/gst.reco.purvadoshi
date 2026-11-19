@@ -588,7 +588,7 @@ def _find_hdr(rows,spec,required,min_hits=2,scan=40):
 # ── BOOKS: scan (layout + ledger guesses) ────────────────────────────────────
 def scan_books(fb, cn_fb=None):
     wb_list = [load_wb(fb)] + ([load_wb(cn_fb)] if cn_fb else [])
-    recs=[]; layout=[]; warns=[]
+    recs=[]; layout=[]; warns=[]; noinv_any=False
     meta_comp = None; meta_gst = None; meta_per = None; edu_total = 0
     for ws in [w for wb in wb_list for w in wb.worksheets]:
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
@@ -1319,7 +1319,7 @@ PB_COLS={
  "sinv": [r"^supplier inv(oice)?\.? ?(no|number|num)\.?$",r"^(party|vendor|bill|supplier) ?(bill|invoice|inv)\.? ?(no|number)\.?$",r"^ref(erence)?\.? ?(no|number)\.?$",r"^supplier ref",r"^invoice (no|number)\.?$",r"^bill (no|number)\.?$",r"^inv\.? ?(no|number)\.?$"],
  "sdate":[r"^supplier inv(oice)?\.? ?date$",r"^(party|vendor|bill|supplier) ?(bill|invoice|inv)\.? ?date$",r"^ref(erence)?\.? date$",r"^invoice date$",r"^bill date$"],
  "gstin":[r"^gstin(/uin)?$",r"^gst ?(no|number|in)\.?$",r"^(supplier|party|vendor) gstin(/uin)?$",r"gstin"],
- "gross":[r"^gross total$",r"^invoice (value|amount|total)$",r"^total( amount| value)?$",r"^bill (value|amount)$",r"^grand total$"],
+ "gross":[r"^gross total$",r"^invoice (value|amount|total)\b",r"^total( amount| value)?$",r"^bill (value|amount)\b",r"^grand total$"],
  "narr": [r"^narration$",r"^remarks?$"],
 }
 PB_INFO=[r"^supplier",r"^vendor",r"^party",r"^bill",r"inv(oice)?\.? ?(no|num|date)",r"^ref",r"^pos$",r"^place of"]
@@ -1340,6 +1340,20 @@ def guess_pvtype(v):
     t=_hn(v)
     return "Credit/Debit Note" if re.search(r"debit note|dr\.? ?note|credit note|cr\.? ?note|purchase return|\bcn\b|\bdn\b|return",t) else "Invoice"
 
+def _guess_party_col(data,used,sample=200):
+    """party/supplier column whose header is a ledger name (e.g. 'purchase'): first mostly-text, non-date column"""
+    d=data[:sample]; n=len(d)
+    if n==0: return None
+    best=None; bs=0
+    for ci in range(max((len(r) for r in d),default=0)):
+        if ci in used: continue
+        vals=[r[ci] for r in d if ci<len(r) and r[ci] not in (None,"")]
+        if len(vals)<max(3,0.5*n): continue
+        txt=[v for v in vals if isinstance(v,str) and not is_num(v) and to_date(v) is None]
+        sc=len(txt)/len(vals)
+        if sc>=0.8 and len(set(txt))>=2 and sc*len(vals)>bs: best=ci; bs=sc*len(vals)
+    return best
+
 def scan_pbooks(fb, dn_fb=None):
     """Header-driven flat purchase register. Returns None if no flat layout is found (→ legacy parsers)."""
     wb_list = [load_wb(fb)] + ([load_wb(dn_fb)] if dn_fb else [])
@@ -1349,7 +1363,14 @@ def scan_pbooks(fb, dn_fb=None):
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
         if not rows: continue
         hr,cm=_find_hdr(rows,PB_COLS,[],3)
-        if hr is None or not ("sinv" in cm or "vch" in cm) or "party" not in cm: continue
+        if hr is None: hr,cm=_find_hdr(rows,PB_COLS,["date","gstin"],2)
+        if hr is None: continue
+        noinv=not ("sinv" in cm or "vch" in cm)
+        if "party" not in cm:
+            pc=_guess_party_col(rows[hr+1:],set(cm.values()))
+            if pc is not None: cm["party"]=pc
+        if "party" not in cm: continue
+        if noinv and not ("date" in cm and "gstin" in cm): continue
         meta_company = None; meta_gstin = None; meta_period = None
         for hr_row in rows[:hr]:
             htext = " ".join(str(v).strip() for v in hr_row if v is not None)
@@ -1375,21 +1396,25 @@ def scan_pbooks(fb, dn_fb=None):
             if name in seen: seen[name]+=1; name=f"{name} ({seen[name]})"
             else: seen[name]=1
             lcols.append((ci,name))
+        if noinv and not lcols: continue
         n0=len(recs)
-        for r in data:
+        for ri,r in enumerate(data):
             g=lambda f:(r[cm[f]] if f in cm and cm[f]<len(r) else None)
             party=str(g("party") or "").strip()
             if party.lower() in ("total","grand total","sub total",""): continue
             sinv=str(g("sinv") if g("sinv") is not None else "").strip(); vch=str(g("vch") if g("vch") is not None else "").strip()
             key=sinv or vch
-            if not key and party.lower() not in ("(cancelled )","cancelled"): continue
+            if not key and not noinv and party.lower() not in ("(cancelled )","cancelled"): continue
+            if noinv and not any(is_num(r[ci]) and num(r[ci])!=0 for ci,_ in lcols if ci<len(r)) and "cancel" not in party.lower(): continue
             d_raw = str(g("date") or "").strip().lower()
             if d_raw in ("educational", "education"): edu_total += 1
             rec={"_sheet":ws.title,"_inv":key,"_sinv":sinv,"_vch":vch,"_date":to_date(g("sdate")) or to_date(g("date")),"_bdate":to_date(g("date")),
                  "_party":party,"_gstin":cgstin(g("gstin")),"_vtype":str(g("vtype") or "").strip(),
-                 "_gross":(abs(num(g("gross"))) if "gross" in cm else np.nan),"_narr":str(g("narr") or "")}
+                 "_gross":(abs(num(g("gross"))) if "gross" in cm else np.nan),"_narr":str(g("narr") or ""),
+                 "_row":hr+2+ri,"_noinv":noinv}
             for ci,name in lcols: rec[name]=num(r[ci]) if ci<len(r) else 0.0
             recs.append(rec)
+        if noinv: noinv_any=True; warns.append(f"Sheet '{ws.title}': no Supplier Invoice No / Voucher No column - invoices are matched on GSTIN + taxable value + tax amount (identical amounts paired in date order). Add the Supplier Invoice No column in the Tally export for a stronger, invoice-number based reco.")
         layout.append({"sheet":ws.title,"header_row":hr+1,"rows":len(recs)-n0,"mapped":{k:str(hdr[v]).strip() for k,v in cm.items()},"ledgers":[n for _,n in lcols]})
         if "sinv" not in cm: warns.append(f"Sheet '{ws.title}': no Supplier Invoice No column found - Voucher No used for matching (will not match 2B unless client books supplier invoice no as voucher no).")
     if not recs: return None
@@ -1397,7 +1422,7 @@ def scan_pbooks(fb, dn_fb=None):
     for c in led: bw[c]=pd.to_numeric(bw[c],errors="coerce").fillna(0.0)
     if edu_total > 0:
         warns.append(f"ℹ️ Tally Educational Mode detected: {edu_total} vouchers have 'Educational' date. Vouchers are matched on GSTIN, Invoice Number, and Tax amounts.")
-    return {"bw":bw,"ledger_guess":{c:guess_pledger(c) for c in led},"vtype_guess":{v:guess_pvtype(v) for v in bw["_vtype"].unique()},"layout":layout,"warns":warns,"kind":"flat",
+    return {"bw":bw,"ledger_guess":{c:guess_pledger(c) for c in led},"vtype_guess":{v:guess_pvtype(v) for v in bw["_vtype"].unique()},"layout":layout,"warns":warns,"kind":"flat","noinv":noinv_any,
             "meta":{"company":meta_comp,"gstin":meta_gst,"period":meta_per,"pstart":_pstart(meta_per,""),"edu_count":edu_total}}
 
 def scan_pbooks_legacy(fb):
@@ -1435,7 +1460,8 @@ def build_pbooks(bw,ledger_class,vtype_class):
 def _recs_from_books(d):
     out={"Invoice":[],"Credit/Debit Note":[]}
     for rr in d.to_dict("records"):
-        out[rr["vclass"]].append({"gstin":rr["_gstin"],"party":rr["_party"],"inv":rr["_inv"],"inorm":inorm(rr["_inv"]),"core":icore(rr["_inv"]),
+        _ni=bool(rr.get("_noinv")) and not str(rr["_inv"]).strip()
+        out[rr["vclass"]].append({"gstin":rr["_gstin"],"party":rr["_party"],"inv":(f"(no inv no.) row {rr.get('_row','')}" if _ni else rr["_inv"]),"inorm":(f"~R{rr.get('_row','')}" if _ni else inorm(rr["_inv"])),"core":("" if _ni else icore(rr["_inv"])),
             "date":rr["_date"],"bdate":rr["_bdate"],"taxable":abs(rr["taxable"]),"igst":abs(rr["igst"]),"cgst":abs(rr["cgst"]),"sgst":abs(rr["sgst"]),"cess":abs(rr["cess"]),
             "rigst":abs(rr["rigst"]),"rcgst":abs(rr["rcgst"]),"rsgst":abs(rr["rsgst"]),"cancel":bool(rr["cancel"]),"vch":rr["_vch"],"vtype":rr["_vtype"],"gross":rr["_gross"],
             "src":rr["_sheet"],"cat":rr.get("_cat","")})
@@ -1509,14 +1535,46 @@ def match_itc(B,P):
     tier(lambda r:(r["gstin"],r["inorm"]) if r["gstin"] and r["inorm"] else None,
          lambda r:[(r["gstin"],r["inorm"])]+([(r["gstin"],inorm(r["oinv"]))] if r.get("oinv") else []),"exact")
     tier(lambda r:(r["gstin"],r["core"]) if r["gstin"] and r["core"] else None, lambda r:(r["gstin"],r["core"]) if r["core"] else None,"core")
+    def gtier(kb,kp,how,maxgap=45):
+        """several invoices with identical amounts: pair nearest invoice dates 1-to-1 (within maxgap days); extras stay unmatched"""
+        mb=defaultdict(list); mp=defaultdict(list)
+        for i in ub:
+            k=kb(B[i])
+            if k: mb[k].append(i)
+        for j in up:
+            k=kp(P[j])
+            if k: mp[k].append(j)
+        dk=lambda r:(r.get("date") or r.get("bdate"))
+        for k,bl in mb.items():
+            bl=[i for i in bl if i in ub]; pl=[j for j in mp.get(k,[]) if j in up]
+            if not bl or not pl or (len(bl)==1 and len(pl)==1) or len(bl)*len(pl)>2500: continue
+            cand=[]
+            for i in bl:
+                for j in pl:
+                    di,dj=dk(B[i]),dk(P[j])
+                    gap=abs((di-dj).days) if di and dj else 999
+                    if gap<=maxgap: cand.append((gap,i,j))
+            for gap,i,j in sorted(cand):
+                if i in ub and j in up: pairs.append((i,j,how)); ub.discard(i); up.discard(j)
+    kfull=lambda r:(r["gstin"],round(r.get("taxable",0.0)),round(_ttax(r))) if r["gstin"] and r.get("taxable",0.0)>0 and _ttax(r)>0 else None
+    tier(kfull,kfull,"amt_full"); gtier(kfull,kfull,"amt_grp")
+    ktx=lambda r:(r["gstin"],round(r.get("taxable",0.0))) if r["gstin"] and r.get("taxable",0.0)>0 else None
+    tier(ktx,ktx,"amt_tx")
     tier(lambda r:(r["gstin"],round(_ttax(r))) if r["gstin"] and _ttax(r)>0 else None, lambda r:(r["gstin"],round(_ttax(r))) if _ttax(r)>0 else None,"amount")
+    ktt=lambda r:(r["gstin"],round(_ttax(r))) if r["gstin"] and _ttax(r)>0 else None
+    gtier(ktt,ktt,"amt_grp")
     tier(lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None, lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None,"gstin_typo",lambda b,p:_gstin_close(b["gstin"],p["gstin"]))
+    kng=lambda r:(round(r.get("taxable",0.0)),round(_ttax(r))) if r.get("taxable",0.0)>0 and _ttax(r)>0 else None
+    tier(kng,kng,"gstin_typo",lambda b,p:_gstin_close(b["gstin"],p["gstin"]))
     tier(lambda r:r["inorm"] if len(r["inorm"])>=4 else None, lambda r:r["inorm"] if len(r["inorm"])>=4 else None,"inv_only",
          lambda b,p: _gstin_close(b["gstin"],p["gstin"]) and abs(_ttax(b)-_ttax(p))<=max(1.0,0.05*max(_ttax(b),_ttax(p))))
     return B,P,pairs,sorted(ub),sorted(up)
 
+_HOW={"core":"GSTIN + numeric part of invoice no","amount":"GSTIN + tax amount","amt_full":"GSTIN + taxable value + tax (books register has no invoice no)",
+      "amt_grp":"GSTIN + amounts - several identical-amount invoices paired by nearest date, verify invoice no",
+      "amt_tx":"GSTIN + taxable value (tax amount differs)"}
 def _fmt(x): return f"{abs(x):,.0f}"
-def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice"):
+def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice",bmin=None):
     B,P,pairs,ubl,upl=match_itc(Braw,Praw); rows=[]
     z={"taxable":0.0,"igst":0.0,"cgst":0.0,"sgst":0.0,"cess":0.0,"rigst":0.0,"rcgst":0.0,"rsgst":0.0}
     def mk(b,p,how):
@@ -1548,6 +1606,8 @@ def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice"):
                 stat="2B: ITC not available";pr="Low";rm="2B shows ITC NOT available"+(f": {p['reason']}" if p.get("reason") else "")+" - not in books, nothing to claim"
             elif p.get("amend"):
                 stat="Only in 2B";pr="Low";rm=f"B2BA amendment of earlier-period invoice '{p.get('oinv','')}' (revised GST Rs.{_fmt(pg)}): not new ITC - compare with the original period's books and claim / reverse only the DIFFERENCE"
+            elif bmin and p.get("date") and p["date"]<bmin:
+                stat="Only in 2B";pr="Low";rm=f"Invoice dated {p['date']:%d-%b-%y} is BEFORE this register starts ({bmin:%d-%b-%y}) - probably booked in an earlier month's register (ITC Rs.{_fmt(pg)}); check there before treating as unbooked"
             else:
                 stat="Only in 2B";pr=big(pg);rm=f"Supplier filed (ITC Rs.{_fmt(pg)}) but not in books - book if goods/services received; check cut-off / other register / GSTIN typo in books"
         else:
@@ -1572,7 +1632,7 @@ def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice"):
                 small=abs(bg-pg)>0.005 or any(abs(r["B_"+h.upper()]-r["P_"+h.upper()])>0.005 for h in HEADS)
                 stat="Matched - Rounding" if small else ("Matched" if how=="exact" else "Matched - Inv No differs")
                 if how!="exact": 
-                    stat="Matched - Inv No differs"; pr="Low"; rm=f"Matched on {'GSTIN + numeric part of invoice no' if how=='core' else ('GSTIN + tax amount' if how=='amount' else 'invoice no + amount (GSTIN differs/typo)')}: Books '{r['B_Inv']}' vs 2B '{r['P_Inv']}'"
+                    stat="Matched - Inv No differs"; pr="Low"; rm=f"Matched on {_HOW.get(how,'invoice no + amount (GSTIN differs/typo)')}: Books '{r['B_Inv']}' vs 2B '{r['P_Inv']}'"
                     if how=="gstin_typo": stat="Mismatch"; pr="Medium"; rm=f"GSTIN in books ({b.get('gstin') or 'blank'}) differs from 2B ({p.get('gstin')}) - correct supplier GSTIN in books"
                 elif small: pr="Low"; rm="Within rounding"
                 if P_rcm and b_rcm: stat="Matched - RCM";pr="Low";rm="RCM booked in RCM ledgers and agrees with 2B - confirm tax paid in cash in 3.1(d); ITC in 4(A)(3) only after payment"
@@ -1598,9 +1658,22 @@ def run_itc_v2(pr_bytes,b2b_bytes,ledger_class=None,vtype_class=None,tol=1.0,mat
     allp=pt["inv"]+pt["notes"]
     filled=_name_gstin_map(rec["Invoice"]+rec["Credit/Debit Note"],allp)
     has_tx=(scan["kind"]=="flat") and any(r["taxable"]>0 for r in rec["Invoice"])
-    inv=reco_itc(rec["Invoice"],pt["inv"],tol,mat,has_tx,"Invoice"); notes=reco_itc(rec["Credit/Debit Note"],pt["notes"],tol,mat,has_tx,"Note")
+    _bd=[r_.get("bdate") or r_.get("date") for r_ in rec["Invoice"] if (r_.get("bdate") or r_.get("date"))]
+    bmin=min(_bd) if _bd else None
+    inv=reco_itc(rec["Invoice"],pt["inv"],tol,mat,has_tx,"Invoice",bmin=bmin); notes=reco_itc(rec["Credit/Debit Note"],pt["notes"],tol,mat,has_tx,"Note")
     imp_books=[r for r in rec["Invoice"] if "custom" in str(r.get("cat","")).lower() or re.search(r"custom|boe|bill of entry|import",str(r["party"]).lower()) and not r["gstin"]]
     warns=list(scan["warns"])+list(pt["warns"])
+    try:
+        ps=(pt.get("meta") or {}).get("pstart"); late={}
+        if ps:
+            for r_ in allp:
+                m_=re.match(r"^([A-Za-z]{3})[a-z]*'?\s*-?\s*(\d{2,4})$",str(r_.get("period","")).strip())
+                if m_ and m_.group(1).lower() in _MONTHS:
+                    yy=int(m_.group(2)); yy=yy+2000 if yy<100 else yy
+                    if (yy,_MONTHS[m_.group(1).lower()])>(ps.year,ps.month): late[r_["period"]]=late.get(r_["period"],0)+1
+        if late:
+            warns.insert(0,"2B file looks MIXED: it is a "+str((pt.get("meta") or {}).get("Period",""))+" 2B but "+", ".join(f"{n} document(s) have GSTR-1 period {k}" for k,n in late.items())+" - rows from a later month's 2B seem to be pasted into this sheet, so the portal ITC-summary check below does not apply. Reconcile month-wise with each month's own 2B download (or keep this as a deliberate multi-month reco).")
+    except Exception: pass
     from collections import Counter as _C
     for _lab,_L in (("invoice",rec["Invoice"]),("credit/debit note",rec["Credit/Debit Note"])):
         _c=_C((r["gstin"] or "~"+cname(r["party"]),r["inorm"]) for r in _L if r["inorm"])
