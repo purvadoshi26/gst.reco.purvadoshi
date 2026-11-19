@@ -375,4 +375,4 @@ with tab3:
         """)
 
 st.markdown("---")
-st.markdown('<div style="text-align:center;font-size:.74rem;color:#888">GST Audit Reconciliation Tool · Built by <a href="https://linkedin.com/in/purvadoshi26" style="color:#5585B5">Purva Doshi</a> · build 2026-10-18 r2</div>',unsafe_allow_html=True)
+st.markdown('<div style="text-align:center;font-size:.74rem;color:#888">GST Audit Reconciliation Tool · Built by <a href="https://linkedin.com/in/purvadoshi26" style="color:#5585B5">Purva Doshi</a> · build 2026-11-19 r3</div>',unsafe_allow_html=True)
