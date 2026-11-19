@@ -587,10 +587,11 @@ def _find_hdr(rows,spec,required,min_hits=2,scan=40):
 
 # ── BOOKS: scan (layout + ledger guesses) ────────────────────────────────────
 def scan_books(fb, cn_fb=None):
-    wb_list = [load_wb(fb)] + ([load_wb(cn_fb)] if cn_fb else [])
+    _mf=_norm_files(fb); _nf=_norm_files(cn_fb); nmain=len(_mf); multi=len(_mf)+len(_nf)>1
+    wb_list=[(nm_,load_wb(b_)) for nm_,b_ in _mf+_nf]
     recs=[]; layout=[]; warns=[]; noinv_any=False
-    meta_comp = None; meta_gst = None; meta_per = None; edu_total = 0
-    for ws in [w for wb in wb_list for w in wb.worksheets]:
+    meta_comp = None; meta_gst = None; meta_per = None; edu_total = 0; _spans=[]
+    for fi,fname,ws in [(i_,nm_,w_) for i_,(nm_,wb_) in enumerate(wb_list) for w_ in wb_.worksheets]:
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
         if not rows: continue
         hr,cm=_find_hdr(rows,BK_COLS,["inv"],2)
@@ -605,7 +606,7 @@ def scan_books(fb, cn_fb=None):
                 if mg: meta_gstin = mg.group(0)
             if not meta_period:
                 mp = re.search(r"\b\d{1,2}-[A-Za-z]{3}-\d{2,4}\s+to\s+\d{1,2}-[A-Za-z]{3}-\d{2,4}\b", htext, re.I)
-                if mp: meta_period = mp.group(0)
+                if mp: meta_period = mp.group(0); _spans.append(_period_span(meta_period))
             if not meta_company and not re.search(r"\d{1,2}-[A-Za-z]{3}", htext) and not any(k in htext.lower() for k in ("register", "date", "particulars", "gstin", "page", "voucher", "report", "pan :", "email :", "e-mail")):
                 meta_company = htext
         if meta_company and not meta_comp: meta_comp = meta_company
@@ -636,21 +637,23 @@ def scan_books(fb, cn_fb=None):
             if party.lower() in ("total","grand total","sub total") or inv.lower() in ("total","grand total"): continue
             d_raw = str(g("date") or "").strip().lower()
             if d_raw in ("educational", "education"): edu_total += 1
-            rec={"_sheet":ws.title,"_inv":inv,"_date":to_date(g("date")),"_party":party,"_gstin":cgstin(g("gstin")),
-                 "_vtype":str(g("vtype") or "").strip(),"_gross":(abs(num(g("gross"))) if "gross" in cm else np.nan),"_narr":str(g("narr") or "")}
+            rec={"_sheet":ws.title,"_file":fname,"_fidx":fi,"_inv":inv,"_date":to_date(g("date")),"_party":party,"_gstin":cgstin(g("gstin")),
+                 "_vtype":(str(g("vtype") or "").strip() or ("Credit Note" if fi>=nmain else "")),"_gross":(abs(num(g("gross"))) if "gross" in cm else np.nan),"_narr":str(g("narr") or "")}
             for ci,name in lcols: rec[name]=num(r[ci]) if ci<len(r) else 0.0
             recs.append(rec)
-        layout.append({"sheet":ws.title,"header_row":hr+1,"rows":len(recs)-n0,
+        layout.append({"sheet":(fname+": " if multi else "")+ws.title,"file":fname,"header_row":hr+1,"rows":len(recs)-n0,
                        "mapped":{k:str(hdr[v]).strip() for k,v in cm.items()},"ledgers":[n for _,n in lcols]})
     if not recs: raise ValueError("No voucher rows found in the books file.\nNeeded headers: Voucher No / Invoice No, Date, GSTIN, and value/tax ledger columns.")
     bw=pd.DataFrame(recs); led=[c for c in bw.columns if not c.startswith("_")]
     for c in led: bw[c]=pd.to_numeric(bw[c],errors="coerce").fillna(0.0)
+    bw,_nd=_dedupe_across_files(bw)
+    if _nd: warns.append(_dup_warn(_nd,"voucher(s)"))
     if not led: raise ValueError("No value/tax ledger columns detected in the books file (need numeric columns such as sales, IGST, CGST, SGST).")
     if edu_total > 0:
         warns.append(f"ℹ️ Tally Educational Mode detected: {edu_total} vouchers have 'Educational' date. Vouchers are matched on GSTIN, Invoice Number, and Tax amounts per GST standards.")
     return {"bw":bw,"ledger_guess":{c:guess_ledger_class(c) for c in led},
             "vtype_guess":{v:guess_vtype(v) for v in bw["_vtype"].unique()},"layout":layout,"warns":warns,
-            "meta":{"company":meta_comp,"gstin":meta_gst,"period":meta_per,"pstart":_pstart(meta_per,""),"edu_count":edu_total}}
+            "meta":_books_meta(meta_comp,meta_gst,meta_per,_spans,edu_total)}
 
 STD_RATES=[0,0.1,0.25,1,1.5,3,5,6,7.5,12,14,18,28,40]
 def build_books(bw,ledger_class,vtype_class):
@@ -891,11 +894,11 @@ def reco_docs(b,p,tol,has_tax,doc="Invoice"):
     m["_n"]=[bi or pi for bi,pi in zip(m.B_Inv,m.P_Inv)]
     return m.sort_values(["_o","_d","_n"]).drop(columns=["_o","_d","_n","mrg","key"]).reset_index(drop=True)
 
-def _run_sales_reco_raw(portal_bytes,books_bytes,ledger_class=None,vtype_class=None,tol=1.0,scan=None,cn_bytes=None):
+def _run_sales_reco_raw(portal_bytes,books_bytes,ledger_class=None,vtype_class=None,tol=1.0,scan=None,cn_bytes=None,portal=None):
     scan=scan or scan_books(books_bytes,cn_fb=cn_bytes)
     lc=dict(scan["ledger_guess"]); lc.update(ledger_class or {})
     vc=dict(scan["vtype_guess"]); vc.update(vtype_class or {})
-    bk=build_books(scan["bw"],lc,vc); pt=parse_portal(portal_bytes)
+    bk=build_books(scan["bw"],lc,vc); pt=portal or parse_portal_multi(portal_bytes)
     books_tax=float(pd.concat([bk["inv"],bk["notes"]])[["IGST","CGST","SGST"]].abs().sum().sum())>0
     htx=pt["has_tax"] and books_tax
     reco=reco_docs(bk["inv"],pt["inv"],tol,htx,"Invoice")
@@ -1207,10 +1210,14 @@ def _2b_summary(wb):
         if n.strip().lower()=="itc available": ws=wb[n]
     out={}
     if ws is None: return out
+    in_b=False
     for r in ws.iter_rows(values_only=True):
-        if r and str(r[0] or "").strip().lower().startswith("part b"): break
+        if r and str(r[0] or "").strip().lower().startswith("part b"): in_b=True; continue
         if not r or str(r[0] or "").strip() not in ("I","II","III","IV","V"): continue
         h=_hn(r[1]); vals=[num(r[i]) if i<len(r) else 0.0 for i in (3,4,5)]
+        if in_b:
+            if h.startswith("others") and "cn" not in out: out["cn"]=vals
+            continue
         key=("b2b" if "all other" in h else "rcm" if "reverse charge" in h else "isd" if "isd" in h else "imp" if "import" in h else None)
         if key and key not in out: out[key]=vals
     return out
@@ -1218,19 +1225,36 @@ def _2b_summary(wb):
 def _check_2b_summary(summ,inv,notes,isd,imp):
     if not summ: return []
     ok=lambda r: not str(r.get("avail","")).strip().lower().startswith("n")
-    d={"b2b":[0.0]*3,"rcm":[0.0]*3,"isd":[0.0]*3,"imp":[sum(x.get("IGST",0) for x in imp),0.0,0.0]}
-    for r in inv:
-        if r.get("amend") or not ok(r): continue
+    d={"b2b":[0.0]*3,"rcm":[0.0]*3,"isd":[0.0]*3,"imp":[sum(x.get("IGST",0) for x in imp),0.0,0.0],"cn":[0.0]*3}
+    for r in inv:                       # invoices + B2BA amendments (portal Part A adds both)
+        if not ok(r): continue
         k="rcm" if r.get("rcm") else "b2b"
+        for i,h in enumerate(("igst","cgst","sgst")): d[k][i]+=r[h]
+    for r in notes:                     # debit notes sit in Part A, credit notes in Part B
+        if not ok(r): continue
+        if r.get("ntype")=="D": k="rcm" if r.get("rcm") else "b2b"
+        else: k="cn"
         for i,h in enumerate(("igst","cgst","sgst")): d[k][i]+=r[h]
     for r in isd:
         for i,h in enumerate(("igst","cgst","sgst")): d["isd"][i]+=r[h]
-    nm={"b2b":"B2B ITC (4(A)(5))","rcm":"reverse-charge supplies","isd":"ISD credit","imp":"import of goods"}; w=[]
+    nm={"b2b":"B2B ITC (4(A)(5))","rcm":"reverse-charge supplies","isd":"ISD credit","imp":"import of goods","cn":"credit notes (Part B)"}; w=[]
     for k,v in summ.items():
+        if k not in d: continue
         diff=[round(a-b,2) for a,b in zip(d[k],v)]
         if any(abs(x)>1 for x in diff):
             w.append(f"2B detail sheets vs portal ITC summary differ for {nm[k]} (IGST/CGST/SGST diff {diff[0]:,.2f} / {diff[1]:,.2f} / {diff[2]:,.2f}) - an amended invoice, credit note or sheet may be missing or mis-read; check before relying on the reco.")
     return w
+
+def _late_docs(recs,ps):
+    """documents whose GSTR-1 period is AFTER this 2B's own month -> {period label: count}"""
+    late={}
+    if not ps: return late
+    for r_ in recs:
+        m_=re.match(r"^([A-Za-z]{3})[a-z]*'?\s*-?\s*(\d{2,4})$",str(r_.get("period","")).strip())
+        if m_ and m_.group(1).lower() in _MONTHS:
+            yy=int(m_.group(2)); yy=yy+2000 if yy<100 else yy
+            if (yy,_MONTHS[m_.group(1).lower()])>(ps.year,ps.month): late[r_["period"]]=late.get(r_["period"],0)+1
+    return late
 
 def parse_2b_full(fb):
     wb=load_wb(fb); inv=[]; notes=[]; isd=[]; imp=[]; layout=[]; warns=[]; bad_g=[]
@@ -1303,12 +1327,172 @@ def parse_2b_full(fb):
     for L in (inv,notes,isd):
         for r in L: r["inorm"]=inorm(r["inv"]); r["core"]=icore(r["inv"])
     if bad_g: warns.append(f"{len(bad_g)} 2B row(s) were SKIPPED because the supplier GSTIN is not a valid 15-character GSTIN (e.g. {'; '.join(bad_g[:4])}) - check the file; ITC on these rows is not in the reco.")
+    meta=_readme_meta(wb); summ={}
+    late=_late_docs(inv+notes,meta.get("pstart"))
+    if late:
+        warns.insert(0,"This 2B file is for "+str(meta.get("Period",""))+" but "+", ".join(f"{n} document(s) have GSTR-1 period {k}" for k,n in late.items())+" - another month's 2B looks pasted into it, so the portal ITC-summary check is skipped for this file. Upload each month's 2B as a SEPARATE file instead of merging.")
     try:
         summ=_2b_summary(wb)
-        warns+=_check_2b_summary(summ,inv,notes,isd,imp)
+        if not late: warns+=_check_2b_summary(summ,inv,notes,isd,imp)
     except Exception:
         summ={}
-    return {"inv":inv,"notes":notes,"isd":isd,"imp":imp,"layout":layout,"warns":warns,"summary":summ,"meta":_readme_meta(wb)}
+    return {"inv":inv,"notes":notes,"isd":isd,"imp":imp,"layout":layout,"warns":warns,"summary":summ,"meta":meta}
+
+
+# ── MULTI-FILE SUPPORT (several months / several registers uploaded separately) ──────────
+def _norm_files(x):
+    """None | bytes | (name,bytes) | list of those  ->  [(name,bytes)]"""
+    if x is None: return []
+    if isinstance(x,(bytes,bytearray)): return [("file 1",bytes(x))]
+    if isinstance(x,tuple) and len(x)==2 and isinstance(x[1],(bytes,bytearray)): return [(str(x[0]),bytes(x[1]))]
+    out=[]
+    for i,it in enumerate(list(x)):
+        if isinstance(it,(bytes,bytearray)): out.append((f"file {i+1}",bytes(it)))
+        else: out.append((str(it[0]),bytes(it[1])))
+    return out
+
+def _period_span(text):
+    """'1-Sep-26 to 31-Oct-26' -> (date(2026,9,1), date(2026,10,1)) month starts of both ends"""
+    ds=re.findall(r"\b\d{1,2}-[A-Za-z]{3}-\d{2,4}\b",str(text or ""))
+    if not ds: return (None,None)
+    a=_pstart(ds[0],""); b=_pstart(ds[-1],"")
+    return (a,b or a)
+
+def _books_meta(comp,gst,per,spans,edu):
+    sp=[s_ for s_ in spans if s_ and s_[0]]
+    lo=min(s_[0] for s_ in sp) if sp else _pstart(per,"")
+    hi=max(s_[1] for s_ in sp) if sp else lo
+    if len(sp)>1 and lo and hi: per=f"{lo:%b-%Y} to {hi:%b-%Y}"
+    return {"company":comp,"gstin":gst,"period":per,"pstart":lo,"pend":hi,"edu_count":edu}
+
+def _dedupe_across_files(bw):
+    """identical voucher (same no., date, party, GSTIN and amounts) found in TWO different uploaded files = overlapping exports -> keep one.
+    Identical rows inside the SAME file are left alone (real double postings are for the auditor to see)."""
+    if "_fidx" not in bw.columns or bw["_fidx"].nunique()<2: return bw,0
+    led=[c for c in bw.columns if not c.startswith("_")]
+    first={}; keep=[]
+    for r in bw.to_dict("records"):
+        k=(str(r.get("_inv")),str(r.get("_date")),str(r.get("_party")).strip().lower(),str(r.get("_gstin")))+tuple(round(float(r[c] or 0),2) for c in led)
+        f0=first.setdefault(k,r["_fidx"]); keep.append(f0==r["_fidx"])
+    keep=pd.Series(keep,index=bw.index)
+    return bw[keep].reset_index(drop=True),int((~keep).sum())
+
+def _dup_warn(n,what):
+    return f"{n} {what} appeared in MORE THAN ONE uploaded file (same number, date, party and amounts) and were counted once - the files overlap; check you did not upload the same month twice."
+
+def _combine_meta(metas,names):
+    """one meta dict for several portal files: first file's identity + month range"""
+    metas=[m or {} for m in metas]
+    if not metas: return {}
+    m0=dict(metas[0]); ps=[m["pstart"] for m in metas if m.get("pstart")]
+    if ps:
+        m0["pstart"]=min(ps); m0["pend"]=max(ps)
+        labs=[]
+        for d in sorted(set(ps)): labs.append(d.strftime("%b-%Y"))
+        if len(metas)>1: m0["Period"]=", ".join(labs)
+    else: m0["pend"]=m0.get("pstart")
+    m0["files"]=list(names)
+    return m0
+
+def merge_2b_parts(parts):
+    """parts=[{'name','parsed'}] (parsed = parse_2b_full output) -> one parse_2b_full-style dict (+ 'parts')"""
+    inv=[];notes=[];isd=[];imp=[];layout=[];warns=[];seen={};dup=0;summ={}
+    multi=len(parts)>1
+    for fi,p in enumerate(parts):
+        d=p["parsed"]; nm=p["name"]
+        for kind,lst,dst in (("i",d["inv"],inv),("n",d["notes"],notes),("s",d["isd"],isd)):
+            for r in lst:
+                r["file"]=nm
+                k=(kind,r["gstin"],r["inorm"],str(r["date"]),round(r["taxable"],2),round(r["igst"],2),round(r["cgst"],2),round(r["sgst"],2),r["ntype"],bool(r["amend"]))
+                if seen.setdefault(k,fi)!=fi: dup+=1; continue
+                dst.append(r)
+        for r in d["imp"]:
+            r["File"]=nm
+            k=("m",r["Port"],r["BE No"],r["BE Date"],round(r["IGST"],2))
+            if seen.setdefault(k,fi)!=fi: dup+=1; continue
+            imp.append(r)
+        for L in d["layout"]:
+            L=dict(L); L["file"]=nm
+            if multi: L["sheet"]=f"{nm}: {L['sheet']}"
+            layout.append(L)
+        for w in d["warns"]: warns.append((f"[{nm}] " if multi else "")+w)
+        summ[nm]=d.get("summary",{})
+    metas=[p["parsed"]["meta"] for p in parts]; names=[p["name"] for p in parts]
+    if dup: warns.append(_dup_warn(dup,"2B document(s)"))
+    if multi:
+        from collections import Counter as _Cn
+        c=_Cn(m.get("pstart") for m in metas if m.get("pstart"))
+        rep_=[f"{k:%b-%Y}" for k,v in c.items() if v>1]
+        if rep_: warns.append("More than one 2B file is for the same month ("+", ".join(rep_)+") - upload each month's 2B once.")
+    return {"inv":inv,"notes":notes,"isd":isd,"imp":imp,"layout":layout,"warns":warns,"summary":summ,"meta":_combine_meta(metas,names),
+            "parts":[{"name":p["name"],"meta":p["parsed"]["meta"],"n_inv":len(p["parsed"]["inv"]),"n_notes":len(p["parsed"]["notes"]),
+                      "n_isd":len(p["parsed"]["isd"]),"n_imp":len(p["parsed"]["imp"]),"parsed":p["parsed"]} for p in parts]}
+
+def parse_2b_multi(files):
+    """one or MANY GSTR-2B Excel files (one per month) -> merged result. A single file behaves exactly like parse_2b_full."""
+    fl=_norm_files(files)
+    if not fl: raise ValueError("No GSTR-2B file uploaded.")
+    parts=[]
+    for nm,b in fl:
+        try: parts.append({"name":nm,"parsed":parse_2b_full(b)})
+        except Exception as e: raise ValueError(f"{nm}: {e}")
+    g={p["parsed"]["meta"].get("GSTIN") for p in parts if p["parsed"]["meta"].get("GSTIN")}
+    if len(g)>1: raise ValueError("The uploaded 2B files belong to DIFFERENT GSTINs ("+", ".join(sorted(g))+") - do not mix clients.")
+    return merge_2b_parts(parts)
+
+def merge_portal_parts(parts):
+    """parts=[{'name','parsed'}] (parse_portal output) -> one parse_portal-style dict"""
+    multi=len(parts)>1; warns=[]; layout=[]; hs=None; hb=None; has_tax=False; frames={"inv":[],"notes":[]}; seen=set(); dup=0; first={}
+    def addh(a,b):
+        if b is None: return a
+        a=a or {"Taxable":0.0,"IGST":0.0,"CGST":0.0,"SGST":0.0}
+        return {k:a[k]+b.get(k,0.0) for k in a}
+    for fi,p in enumerate(parts):
+        d=p["parsed"]; nm=p["name"]
+        for key in ("inv","notes"):
+            f=d[key]
+            if f is None or not len(f): continue
+            f=f.copy(); f["file"]=nm; f["_fi"]=fi
+            keep=[]
+            for r in f.itertuples():
+                k=(key,r.inv_norm,r.gstin,round(float(r.Taxable),2),round(float(r.IGST),2),round(float(r.CGST),2),round(float(r.SGST),2))
+                if k in seen and fi!=first.get(k,fi): keep.append(False); dup+=1
+                else: keep.append(True); seen.add(k); first.setdefault(k,fi)
+            frames[key].append(f[pd.Series(keep,index=f.index)])
+        hs=addh(hs,d.get("hsn")); hb=addh(hb,d.get("hsn_b2b")); has_tax=has_tax or d.get("has_tax",False)
+        for L in d["layout"]:
+            L=dict(L); L["file"]=nm
+            if multi: L["sheet"]=f"{nm}: {L['sheet']}"
+            layout.append(L)
+        for w in d["warns"]: warns.append((f"[{nm}] " if multi else "")+w)
+    if dup: warns.append(_dup_warn(dup,"portal document(s)"))
+    cols=["inv","date","name","gstin","Taxable","IGST","CGST","SGST","value","ntype","cancelled","sheet","inv_norm","stype","apstat","aperr"]
+    out={}
+    for key in ("inv","notes"):
+        out[key]=pd.concat(frames[key],ignore_index=True) if frames[key] else pd.DataFrame(columns=cols)
+    metas=[p["parsed"]["meta"] for p in parts]
+    return {"inv":out["inv"],"notes":out["notes"],"hsn":hs,"hsn_b2b":hb,"layout":layout,"warns":warns,"has_tax":has_tax,
+            "meta":_combine_meta(metas,[p["name"] for p in parts]),
+            "parts":[{"name":p["name"],"meta":p["parsed"]["meta"],"n_inv":len(p["parsed"]["inv"]),"n_notes":len(p["parsed"]["notes"]),"parsed":p["parsed"]} for p in parts]}
+
+def parse_portal_multi(files):
+    """one or MANY E-invoice / GSTR-1 portal files (one per month) -> merged result"""
+    fl=_norm_files(files)
+    if not fl: raise ValueError("No portal file uploaded.")
+    parts=[]
+    for nm,b in fl:
+        try: parts.append({"name":nm,"parsed":parse_portal(b)})
+        except Exception as e: raise ValueError(f"{nm}: {e}")
+    g={p["parsed"]["meta"].get("GSTIN") for p in parts if p["parsed"]["meta"].get("GSTIN")}
+    if len(g)>1: raise ValueError("The uploaded portal files belong to DIFFERENT GSTINs ("+", ".join(sorted(g))+") - do not mix clients.")
+    return merge_portal_parts(parts)
+
+def _name_close(a,b):
+    a,b=cname(a),cname(b)
+    if not a or not b: return False
+    if a==b: return True
+    import difflib
+    return difflib.SequenceMatcher(None,a,b).ratio()>=0.88
 
 # ── BOOKS (purchase register) ────────────────────────────────────────────────
 PB_COLS={
@@ -1357,10 +1541,11 @@ def _guess_party_col(data,used,sample=200):
 
 def scan_pbooks(fb, dn_fb=None):
     """Header-driven flat purchase register. Returns None if no flat layout is found (→ legacy parsers)."""
-    wb_list = [load_wb(fb)] + ([load_wb(dn_fb)] if dn_fb else [])
+    _mf=_norm_files(fb); _nf=_norm_files(dn_fb); nmain=len(_mf); multi=len(_mf)+len(_nf)>1
+    wb_list=[(nm_,load_wb(b_)) for nm_,b_ in _mf+_nf]
     recs=[]; layout=[]; warns=[]; noinv_any=False
-    meta_comp = None; meta_gst = None; meta_per = None; edu_total = 0
-    for ws in [w for wb in wb_list for w in wb.worksheets]:
+    meta_comp = None; meta_gst = None; meta_per = None; edu_total = 0; _spans=[]
+    for fi,fname,ws in [(i_,nm_,w_) for i_,(nm_,wb_) in enumerate(wb_list) for w_ in wb_.worksheets]:
         rows=[list(r) for r in ws.iter_rows(values_only=True)]
         if not rows: continue
         hr,cm=_find_hdr(rows,PB_COLS,[],3)
@@ -1381,7 +1566,7 @@ def scan_pbooks(fb, dn_fb=None):
                 if mg: meta_gstin = mg.group(0)
             if not meta_period:
                 mp = re.search(r"\b\d{1,2}-[A-Za-z]{3}-\d{2,4}\s+to\s+\d{1,2}-[A-Za-z]{3}-\d{2,4}\b", htext, re.I)
-                if mp: meta_period = mp.group(0)
+                if mp: meta_period = mp.group(0); _spans.append(_period_span(meta_period))
             if not meta_company and not re.search(r"\d{1,2}-[A-Za-z]{3}", htext) and not any(k in htext.lower() for k in ("register", "date", "particulars", "gstin", "page", "voucher", "report", "pan :", "email :", "e-mail")):
                 meta_company = htext
         if meta_company and not meta_comp: meta_comp = meta_company
@@ -1409,22 +1594,24 @@ def scan_pbooks(fb, dn_fb=None):
             if noinv and not any(is_num(r[ci]) and num(r[ci])!=0 for ci,_ in lcols if ci<len(r)) and "cancel" not in party.lower(): continue
             d_raw = str(g("date") or "").strip().lower()
             if d_raw in ("educational", "education"): edu_total += 1
-            rec={"_sheet":ws.title,"_inv":key,"_sinv":sinv,"_vch":vch,"_date":to_date(g("sdate")) or to_date(g("date")),"_bdate":to_date(g("date")),
-                 "_party":party,"_gstin":cgstin(g("gstin")),"_vtype":str(g("vtype") or "").strip(),
+            rec={"_sheet":ws.title,"_file":fname,"_fidx":fi,"_inv":key,"_sinv":sinv,"_vch":vch,"_date":to_date(g("sdate")) or to_date(g("date")),"_bdate":to_date(g("date")),
+                 "_party":party,"_gstin":cgstin(g("gstin")),"_vtype":(str(g("vtype") or "").strip() or ("Debit Note" if fi>=nmain else "")),
                  "_gross":(abs(num(g("gross"))) if "gross" in cm else np.nan),"_narr":str(g("narr") or ""),
                  "_row":hr+2+ri,"_noinv":noinv}
             for ci,name in lcols: rec[name]=num(r[ci]) if ci<len(r) else 0.0
             recs.append(rec)
         if noinv: noinv_any=True; warns.append(f"Sheet '{ws.title}': no Supplier Invoice No / Voucher No column - invoices are matched on GSTIN + taxable value + tax amount (identical amounts paired in date order). Add the Supplier Invoice No column in the Tally export for a stronger, invoice-number based reco.")
-        layout.append({"sheet":ws.title,"header_row":hr+1,"rows":len(recs)-n0,"mapped":{k:str(hdr[v]).strip() for k,v in cm.items()},"ledgers":[n for _,n in lcols]})
+        layout.append({"sheet":(fname+": " if multi else "")+ws.title,"file":fname,"header_row":hr+1,"rows":len(recs)-n0,"mapped":{k:str(hdr[v]).strip() for k,v in cm.items()},"ledgers":[n for _,n in lcols]})
         if "sinv" not in cm: warns.append(f"Sheet '{ws.title}': no Supplier Invoice No column found - Voucher No used for matching (will not match 2B unless client books supplier invoice no as voucher no).")
     if not recs: return None
     bw=pd.DataFrame(recs); led=[c for c in bw.columns if not c.startswith("_")]
     for c in led: bw[c]=pd.to_numeric(bw[c],errors="coerce").fillna(0.0)
+    bw,_nd=_dedupe_across_files(bw)
+    if _nd: warns.append(_dup_warn(_nd,"voucher(s)"))
     if edu_total > 0:
         warns.append(f"ℹ️ Tally Educational Mode detected: {edu_total} vouchers have 'Educational' date. Vouchers are matched on GSTIN, Invoice Number, and Tax amounts.")
     return {"bw":bw,"ledger_guess":{c:guess_pledger(c) for c in led},"vtype_guess":{v:guess_pvtype(v) for v in bw["_vtype"].unique()},"layout":layout,"warns":warns,"kind":"flat","noinv":noinv_any,
-            "meta":{"company":meta_comp,"gstin":meta_gst,"period":meta_per,"pstart":_pstart(meta_per,""),"edu_count":edu_total}}
+            "meta":_books_meta(meta_comp,meta_gst,meta_per,_spans,edu_total)}
 
 def scan_pbooks_legacy(fb):
     """Tally sub-row / pivot formats via the original parser → invoice records (no taxable value)."""
@@ -1444,7 +1631,13 @@ def scan_pbooks_legacy(fb):
 def scan_pbooks_any(fb, dn_fb=None):
     s=scan_pbooks(fb, dn_fb=dn_fb)
     if s is not None: return s
-    try: return scan_pbooks_legacy(fb)
+    try:
+        fl=_norm_files(fb); parts=[]
+        for i_,(nm_,b_) in enumerate(fl):
+            sc=scan_pbooks_legacy(b_); sc["bw"]=sc["bw"].assign(_file=nm_,_fidx=i_); parts.append(sc)
+        s0=parts[0]
+        if len(parts)>1: s0["bw"]=pd.concat([x["bw"] for x in parts],ignore_index=True)
+        return s0
     except Exception as e: raise ValueError("Could not read the purchase register.\nNeeded headers: Date · Particulars · Voucher No · Supplier Invoice No · GSTIN/UIN · Input IGST / CGST / SGST ledger columns.\n("+str(e)[:120]+")")
 
 def build_pbooks(bw,ledger_class,vtype_class):
@@ -1462,7 +1655,7 @@ def _recs_from_books(d):
     out={"Invoice":[],"Credit/Debit Note":[]}
     for rr in d.to_dict("records"):
         _ni=bool(rr.get("_noinv")) and not str(rr["_inv"]).strip()
-        out[rr["vclass"]].append({"gstin":rr["_gstin"],"party":rr["_party"],"inv":(f"(no inv no.) row {rr.get('_row','')}" if _ni else rr["_inv"]),"inorm":(f"~R{rr.get('_row','')}" if _ni else inorm(rr["_inv"])),"core":("" if _ni else icore(rr["_inv"])),
+        out[rr["vclass"]].append({"gstin":rr["_gstin"],"party":rr["_party"],"inv":(f"(no inv no.) row {rr.get('_row','')}"+(f" (file {int(rr.get('_fidx',0))+1})" if rr.get('_fidx',0) else "") if _ni else rr["_inv"]),"inorm":(f"~R{rr.get('_fidx',0)}_{rr.get('_row','')}" if _ni else inorm(rr["_inv"])),"core":("" if _ni else icore(rr["_inv"])),
             "date":rr["_date"],"bdate":rr["_bdate"],"taxable":abs(rr["taxable"]),"igst":abs(rr["igst"]),"cgst":abs(rr["cgst"]),"sgst":abs(rr["sgst"]),"cess":abs(rr["cess"]),
             "rigst":abs(rr["rigst"]),"rcgst":abs(rr["rcgst"]),"rsgst":abs(rr["rsgst"]),"cancel":bool(rr["cancel"]),"vch":rr["_vch"],"vtype":rr["_vtype"],"gross":rr["_gross"],
             "src":rr["_sheet"],"cat":rr.get("_cat","")})
@@ -1564,7 +1757,7 @@ def match_itc(B,P):
     tier(lambda r:(r["gstin"],round(_ttax(r))) if r["gstin"] and _ttax(r)>0 else None, lambda r:(r["gstin"],round(_ttax(r))) if _ttax(r)>0 else None,"amount")
     ktt=lambda r:(r["gstin"],round(_ttax(r))) if r["gstin"] and _ttax(r)>0 else None
     gtier(ktt,ktt,"amt_grp")
-    tier(lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None, lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None,"gstin_typo",lambda b,p:_gstin_close(b["gstin"],p["gstin"]))
+    tier(lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None, lambda r:(r["inorm"],round(_ttax(r))) if r["inorm"] and _ttax(r)>0 else None,"gstin_typo",lambda b,p:_gstin_close(b["gstin"],p["gstin"]) or _name_close(b.get("party"),p.get("party")))
     kng=lambda r:(round(r.get("taxable",0.0)),round(_ttax(r))) if r.get("taxable",0.0)>0 and _ttax(r)>0 else None
     tier(kng,kng,"gstin_typo",lambda b,p:_gstin_close(b["gstin"],p["gstin"]))
     tier(lambda r:r["inorm"] if len(r["inorm"])>=4 else None, lambda r:r["inorm"] if len(r["inorm"])>=4 else None,"inv_only",
@@ -1583,7 +1776,7 @@ def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice",bmin=None):
         r={"B_Inv":b.get("inv",""),"P_Inv":p.get("inv",""),"Date":p.get("date") or b.get("date"),"B_Date":b.get("date"),"P_Date":p.get("date"),
            "Party":b.get("party") or p.get("party",""),"P_Party":p.get("party",""),"B_GSTIN":b.get("gstin",""),"P_GSTIN":p.get("gstin",""),"GSTIN":p.get("gstin") or b.get("gstin",""),
            "B_Tax":b.get("taxable",0.0),"P_Tax":p.get("taxable",0.0),"how":how,"src":p.get("src",""),"ntype":p.get("ntype",""),"avail":p.get("avail",""),"reason":p.get("reason",""),
-           "B_VType":b.get("vtype",""),"Period":p.get("period",""),"has_b":bool(b),"has_p":bool(p),"amend":p.get("amend",False)}
+           "B_VType":b.get("vtype",""),"Period":p.get("period",""),"file":p.get("file",""),"has_b":bool(b),"has_p":bool(p),"amend":p.get("amend",False)}
         for h in HEADS: r["B_"+h.upper()]=b.get(h,0.0); r["P_"+h.upper()]=p.get(h,0.0)
         r["B_RCM"]=b.get("rigst",0.0)+b.get("rcgst",0.0)+b.get("rsgst",0.0); r["P_Cess"]=p.get("cess",0.0); r["B_Cess"]=b.get("cess",0.0)
         if r["B_RCM"]>0:   # RCM ledgers are compared head-wise with 2B tax
@@ -1653,7 +1846,7 @@ def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice",bmin=None):
     return df.sort_values(["_o","Party","_d"]).drop(columns=["_o","_d"]).reset_index(drop=True)
 
 def run_itc_v2(pr_bytes,b2b_bytes,ledger_class=None,vtype_class=None,tol=1.0,mat=10000.0,scan=None,pt=None,dn_bytes=None):
-    pt=pt or parse_2b_full(b2b_bytes); scan=scan or scan_pbooks_any(pr_bytes, dn_fb=dn_bytes)
+    pt=pt or parse_2b_multi(b2b_bytes); scan=scan or scan_pbooks_any(pr_bytes, dn_fb=dn_bytes)
     lc=dict(scan["ledger_guess"]); lc.update(ledger_class or {}); vc=dict(scan["vtype_guess"]); vc.update(vtype_class or {})
     d=build_pbooks(scan["bw"],lc,vc); rec=_recs_from_books(d)
     allp=pt["inv"]+pt["notes"]
@@ -1664,17 +1857,6 @@ def run_itc_v2(pr_bytes,b2b_bytes,ledger_class=None,vtype_class=None,tol=1.0,mat
     inv=reco_itc(rec["Invoice"],pt["inv"],tol,mat,has_tx,"Invoice",bmin=bmin); notes=reco_itc(rec["Credit/Debit Note"],pt["notes"],tol,mat,has_tx,"Note")
     imp_books=[r for r in rec["Invoice"] if "custom" in str(r.get("cat","")).lower() or re.search(r"custom|boe|bill of entry|import",str(r["party"]).lower()) and not r["gstin"]]
     warns=list(scan["warns"])+list(pt["warns"])
-    try:
-        ps=(pt.get("meta") or {}).get("pstart"); late={}
-        if ps:
-            for r_ in allp:
-                m_=re.match(r"^([A-Za-z]{3})[a-z]*'?\s*-?\s*(\d{2,4})$",str(r_.get("period","")).strip())
-                if m_ and m_.group(1).lower() in _MONTHS:
-                    yy=int(m_.group(2)); yy=yy+2000 if yy<100 else yy
-                    if (yy,_MONTHS[m_.group(1).lower()])>(ps.year,ps.month): late[r_["period"]]=late.get(r_["period"],0)+1
-        if late:
-            warns.insert(0,"2B file looks MIXED: it is a "+str((pt.get("meta") or {}).get("Period",""))+" 2B but "+", ".join(f"{n} document(s) have GSTR-1 period {k}" for k,n in late.items())+" - rows from a later month's 2B seem to be pasted into this sheet, so the portal ITC-summary check below does not apply. Reconcile month-wise with each month's own 2B download (or keep this as a deliberate multi-month reco).")
-    except Exception: pass
     from collections import Counter as _C
     for _lab,_L in (("invoice",rec["Invoice"]),("credit/debit note",rec["Credit/Debit Note"])):
         _c=_C((r["gstin"] or "~"+cname(r["party"]),r["inorm"]) for r in _L if r["inorm"])
@@ -2027,16 +2209,29 @@ def twob_refs(pt):
         for c in COLS3: df.loc[df.Line==lab,c]=d[c.lower()]
     return df
 
-def books_sales_net(res):
-    bk=res["books"]; inv=bk["inv"]; nt=bk["notes"]; out={c:float(inv[c].sum()) for c in COLS3}
+def _ym_mask(df,months):
+    if months is None or not len(df): return pd.Series([True]*len(df),index=df.index)
+    return pd.Series([bool(isinstance(d,datetime.date) and (d.year,d.month) in months) for d in df["_date"]],index=df.index)
+
+def books_sales_net(res,months=None):
+    bk=res["books"]; inv=bk["inv"]; nt=bk["notes"]
+    inv=inv[_ym_mask(inv,months)]; nt=nt[_ym_mask(nt,months)]
+    out={c:float(inv[c].sum()) for c in COLS3}
     if len(nt):
         for c in COLS3:
             sgn=sum((1 if "debit" in str(v).lower() else -1)*abs(x) for v,x in zip(nt["_vtype"],nt[c]))
             out[c]+=sgn
     return out
 
-def itc_reco_refs(res):
+def itc_reco_refs(res,files=None,months=None):
     inv=res["inv"]; notes=res["notes"]; pt=res["pt"]
+    if files is not None and len(inv):
+        def _sel(r):
+            if r.has_p: return r.file in files
+            d=r.B_Date
+            return months is None or bool(isinstance(d,datetime.date) and (d.year,d.month) in months)
+        inv=inv[[_sel(r) for r in inv.itertuples()]]
+        pt=dict(pt); pt["notes"]=[r for r in pt["notes"] if r.get("file") in files]
     e=[float(sum(x[k] for x in inv.elig)) for k in (0,1,2)] if len(inv) else [0,0,0]
     cn=[0.0,0.0,0.0]
     for r in pt["notes"]:
