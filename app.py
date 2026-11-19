@@ -9,7 +9,9 @@ import io, re, datetime, hashlib
 import pandas as pd
 import openpyxl
 from collections import defaultdict
+import importlib
 import gst_core as _core
+_core = importlib.reload(_core)
 # bring every core name (including _private helpers) into this module's namespace
 globals().update({k: v for k, v in vars(_core).items() if not k.startswith("__") and k != "st"})
 
@@ -373,11 +375,17 @@ with tab3:
         try: pe_=_pick_portal(parse_portal_multi(_ups(f_ei))); tei_def=einv_net(pe_); srcs.append("e-invoice reference ← uploaded file(s)"); metas.append(("E-invoice",pe_.get("meta",{})))
         except Exception as e: st.warning(f"Could not read e-invoice file: {e}")
     elif sal:
-        pe_=_pick_portal(sal[0]["portal"]); tei_def=einv_net(pe_); metas.append(("E-invoice",pe_.get("meta",{}))); srcs.append("e-invoice reference ← Sales Reco tab ("+", ".join(n_ for n_,_ in _ups(st.session_state.get("sal_inv")))+")")
+        try:
+            pe_=_pick_portal(sal[0]["portal"]); tei_def=einv_net(pe_); metas.append(("E-invoice",pe_.get("meta",{}))); srcs.append("e-invoice reference ← Sales Reco tab ("+", ".join(n_ for n_,_ in _ups(st.session_state.get("sal_inv")))+")")
+        except Exception as e:
+            st.warning(f"Could not load e-invoice reference from Sales tab: {e}")
     if sal:
-        bs=books_sales_net(sal[0],months=sel_months if multi3 else None)
-        for c in COLS3: tbk_def.loc[0,c]=bs[c]
-        srcs.append("books sales ← Sales Reco tab ("+", ".join(n_ for n_,_ in _ups(st.session_state.get("sal_bk")))+")")
+        try:
+            bs=books_sales_net(sal[0],months=sel_months if multi3 else None)
+            for c in COLS3: tbk_def.loc[0,c]=bs.get(c,0.0)
+            srcs.append("books sales ← Sales Reco tab ("+", ".join(n_ for n_,_ in _ups(st.session_state.get("sal_bk")))+")")
+        except Exception as e:
+            st.warning(f"Could not load books sales reference from Sales tab: {e}")
     if itcx:
         _itc_names={p_["name"] for p_ in itcx[0]["pt"]["parts"]}
         _use_f=sel_files if (multi3 and sel_files and sel_files<=_itc_names) else None

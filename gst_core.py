@@ -2217,16 +2217,17 @@ def _is_zero_rated(stype):
 def einv_net(pt):
     """E-invoice portal totals (cancelled documents excluded, credit/debit notes netted) split into
        regular supplies (3.1(a)) and SEZ / export supplies (3.1(b))."""
-    df=zero_tbl(ROWS_EI); inv=pt["inv"]; nt=pt["notes"]
+    df=zero_tbl(ROWS_EI); inv=pt.get("inv",pd.DataFrame()); nt=pt.get("notes",pd.DataFrame())
     if len(inv) and "cancelled" in inv: inv=inv[~inv["cancelled"]]
     if len(nt) and "cancelled" in nt: nt=nt[~nt["cancelled"]]
     for c in COLS3:
         v=[0.0,0.0]
-        if len(inv):
-            for st_,x in zip(inv["stype"] if "stype" in inv else [""]*len(inv),inv[c]): v[1 if _is_zero_rated(st_) else 0]+=x
-        if len(nt):
-            for st_,t_,x in zip(nt["stype"] if "stype" in nt else [""]*len(nt),nt["ntype"],nt[c]):
-                v[1 if _is_zero_rated(st_) else 0]+=(1 if str(t_).upper().startswith("D") else -1)*x
+        if len(inv) and c in inv.columns:
+            for st_,x in zip(inv["stype"] if "stype" in inv else [""]*len(inv),inv[c]): v[1 if _is_zero_rated(st_) else 0]+=float(x or 0.0)
+        if len(nt) and c in nt.columns:
+            ntypes = nt["ntype"] if "ntype" in nt else (nt["_vtype"] if "_vtype" in nt else ["Credit Note"]*len(nt))
+            for st_,t_,x in zip(nt["stype"] if "stype" in nt else [""]*len(nt),ntypes,nt[c]):
+                v[1 if _is_zero_rated(st_) else 0]+=(1 if str(t_).upper().startswith("D") else -1)*float(x or 0.0)
         df.loc[0,c]=v[0]; df.loc[1,c]=v[1]
     return df
 
