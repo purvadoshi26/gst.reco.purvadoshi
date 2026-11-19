@@ -1571,7 +1571,9 @@ def scan_pbooks(fb, dn_fb=None):
         hr,cm=_find_hdr(rows,PB_COLS,[],3)
         if hr is None: hr,cm=_find_hdr(rows,PB_COLS,["date","gstin"],2)
         if hr is None: continue
-        noinv=not ("sinv" in cm or "vch" in cm)
+        sinv_blank = ("sinv" not in cm) or (not any(str(r[cm["sinv"]] if cm["sinv"]<len(r) and r[cm["sinv"]] is not None else "").strip() for r in data))
+        vch_blank = ("vch" not in cm) or (not any(str(r[cm["vch"]] if cm["vch"]<len(r) and r[cm["vch"]] is not None else "").strip() for r in data))
+        noinv = sinv_blank and vch_blank
         if "party" not in cm:
             pc=_guess_party_col(rows[hr+1:],set(cm.values()))
             if pc is not None: cm["party"]=pc
@@ -1823,7 +1825,7 @@ def reco_itc(Braw,Praw,tol,mat,has_taxable,doc="Invoice",bmin=None):
             elif bmin and p.get("date") and p["date"]<bmin:
                 stat="Only in 2B";pr="Low";rm=f"Invoice dated {p['date']:%d-%b-%y} is BEFORE this register starts ({bmin:%d-%b-%y}) - probably booked in an earlier month's register (ITC Rs.{_fmt(pg)}); check there before treating as unbooked"
             else:
-                is_bank = bool(re.search(r"\b(bank|co-?operative bank)\b", str(p.get("party") or "").lower()))
+                is_bank = bool(re.search(r"\b(?:bank|co-?operative bank)\b", str(p.get("party") or "").lower()))
                 stat="Only in 2B";pr=big(pg)
                 if is_bank:
                     rm=f"Bank charges (ITC Rs.{_fmt(pg)}) on 2B - typically booked via Bank Payment vouchers in Tally without purchase invoice; verify if claimed in 3B 4(A)(5)"
@@ -2027,7 +2029,7 @@ def build_itc_excel_v2(res,client,period):
             amt=inv[inv.Status==s]; obs.append(f"{vc[s]} {t} (Books GST Rs.{amt.B_GST.sum():,.0f} / 2B GST Rs.{amt.P_GST.sum():,.0f}).")
     hd=inv[inv.Priority=="High"]
     if len(hd): obs.append(f"{len(hd)} HIGH-priority row(s) (>= Rs.{res['mat']:,.0f} or ITC-risk items).")
-    bank_docs=inv[(inv.Status=="Only in 2B") & inv.Party.str.contains(r"\b(bank|co-?operative bank)\b", case=False, na=False)]
+    bank_docs=inv[(inv.Status=="Only in 2B") & inv.Party.str.contains(r"\b(?:bank|co-?operative bank)\b", case=False, na=False)]
     if len(bank_docs):
         b_gst=bank_docs.P_GST.sum(); b_parties=", ".join(sorted(bank_docs.Party.unique())[:2])
         obs.append(f"{len(bank_docs)} bank charges document(s) on 2B (tax Rs.{b_gst:,.0f}) from {b_parties} - in Tally, bank charges are typically posted via Bank Payment vouchers rather than the Purchase Register; verify payment entries to confirm ITC claim.")
