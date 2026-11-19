@@ -69,14 +69,36 @@ def _check_meta(items):
     g={n:m.get("GSTIN") for n,m in items if m.get("GSTIN")}; p={n:m.get("pstart") for n,m in items if m.get("pstart")}
     if len(set(g.values()))>1: st.error("⛔ These files belong to DIFFERENT GSTINs: "+" · ".join(f"{n}: {v}" for n,v in g.items())+" — do not mix clients.")
     if len(set(p.values()))>1: st.error("⛔ These files are for DIFFERENT tax periods: "+" · ".join(f"{n}: {v:%b-%Y}" for n,v in p.items()))
-def _fsig(*keys):
-    """signature of the files CURRENTLY uploaded under these widget keys (None if any is missing)"""
+def _ups(files):
+    """uploaded file(s) (one, many or None) -> [(name, bytes)]"""
+    if files is None: return []
+    if not isinstance(files,list): files=[files]
+    return [(f.name,f.getvalue()) for f in files]
+def _sig(*groups):
     h=hashlib.md5()
-    for k in keys:
-        f=st.session_state.get(k)
-        if f is None: return None
-        h.update(f.getvalue())
+    for g_ in groups:
+        for n_,b_ in g_: h.update(n_.encode()); h.update(b_)
+        h.update(b"|")
     return h.hexdigest()[:10]
+def _fsig(*keys):
+    """signature of the files CURRENTLY uploaded under these widget keys (None if the first two groups are empty)"""
+    gs=[_ups(st.session_state.get(k)) for k in keys]
+    return None if (len(gs)<2 or not gs[0] or not gs[1]) else _sig(*gs)
+def _mlabel(m):
+    ps=(m or {}).get("pstart"); return f"{ps:%b-%Y}" if ps else str((m or {}).get("Period",""))
+def _ym(d): return (d.year,d.month)
+def _chk_period(books_lbl,portal_lbl,dates,bmeta,pmeta,edu_n=0):
+    """books must cover the SAME months as the portal files (checks first AND last date)"""
+    lo=pmeta.get("pstart"); hi=pmeta.get("pend") or lo
+    if not lo: return
+    rng=f"{lo:%b-%Y}" if _ym(lo)==_ym(hi) else f"{lo:%b-%Y} to {hi:%b-%Y}"
+    blo=bmeta.get("pstart"); bhi=bmeta.get("pend") or blo
+    if blo and (_ym(blo)<_ym(lo) or _ym(bhi)>_ym(hi)):
+        st.error(f"⛔ TAX PERIOD MISMATCH: {books_lbl} indicate period '{bmeta.get('period')}', but {portal_lbl} cover {rng} ({pmeta.get('FY','')})! Upload matching months on both sides - each month as its own file.")
+    elif dates and edu_n==0:
+        mn,mx=min(dates),max(dates)
+        if _ym(mn)<_ym(lo) or _ym(mx)>_ym(hi):
+            st.error(f"⛔ TAX PERIOD MISMATCH: {books_lbl} are dated {mn:%d-%b-%Y} to {mx:%d-%b-%Y}, but {portal_lbl} cover {rng} ({pmeta.get('FY','')})! Add the missing month's portal file (or remove the extra month from books) so both sides cover the same months.")
 def _stamp(*objs):
     return hashlib.md5("|".join(repr(getattr(o,"values",o).tolist() if hasattr(getattr(o,"values",None),"tolist") else o) for o in objs).encode()).hexdigest()[:10]
 
@@ -85,21 +107,21 @@ with tab1:
     st.markdown("### GSTR-2B vs Purchase Register — invoice-wise ITC reco")
     c1,c2=st.columns(2)
     with c1:
-        st.markdown("**File 1 — GSTR-2B Excel (portal)**")
-        st.markdown('<div class="fmtbox">Portal → Returns → GSTR-2B → Download Excel<br>All sheets are read by <b>header name</b>: B2B · B2BA (amendments) · B2B-CDNR (credit/debit notes) · ISD · IMPG. Gets ITC-availability + reverse-charge flags per invoice.</div>',unsafe_allow_html=True)
-        f_2b=st.file_uploader("GSTR-2B",type=["xlsx","xls"],key="itc_2b",label_visibility="collapsed")
+        st.markdown("**File 1 — GSTR-2B Excel(s) (portal)** — one file per month")
+        st.markdown('<div class="fmtbox">Portal → Returns → GSTR-2B → Download Excel<br>All sheets are read by <b>header name</b>: B2B · B2BA (amendments) · B2B-CDNR (credit/debit notes) · ISD · IMPG. Gets ITC-availability + reverse-charge flags per invoice.<br><b>Several months?</b> Select all the monthly 2B files together (or add them one by one). Do <u>not</u> paste months into one sheet.</div>',unsafe_allow_html=True)
+        f_2b=st.file_uploader("GSTR-2B",type=["xlsx","xls"],key="itc_2b",label_visibility="collapsed",accept_multiple_files=True)
     with c2:
-        st.markdown("**File 2 — Purchase Register (Tally / SAP / Excel)**")
+        st.markdown("**File 2 — Purchase Register (Tally / SAP / Excel)** — one file per month, or one for all")
         st.markdown('<div class="fmtbox"><b>Best:</b> flat export — one row per voucher with <code>Voucher No</code> · <code>Supplier Invoice No</code> · <code>GSTIN/UIN</code> · <code>Date</code> + purchase / Input IGST / CGST / SGST ledger columns (any order, any extra columns). Debit-note vouchers in the same file are picked up.<br><b>Also accepted:</b> older Tally sub-row layout · pivot summary (party-level only)</div>',unsafe_allow_html=True)
-        f_pr=st.file_uploader("Purchase Register",type=["xlsx","xls"],key="itc_pr",label_visibility="collapsed")
-        st.markdown("**File 2b — Debit Note Register** *(optional — if exported as a separate file)*")
-        f_dn=st.file_uploader("Debit Note Register (optional)",type=["xlsx","xls"],key="itc_dn",label_visibility="collapsed")
+        f_pr=st.file_uploader("Purchase Register",type=["xlsx","xls"],key="itc_pr",label_visibility="collapsed",accept_multiple_files=True)
+        st.markdown("**File 2b — Debit Note Register(s)** *(optional — one or more files, if exported separately)*")
+        f_dn=st.file_uploader("Debit Note Register (optional)",type=["xlsx","xls"],key="itc_dn",label_visibility="collapsed",accept_multiple_files=True)
     if f_2b and f_pr:
-        eb=f_2b.getvalue(); pbb=f_pr.getvalue(); dnb=f_dn.getvalue() if f_dn else None
-        sig=hashlib.md5(pbb+eb+(dnb or b"")).hexdigest()[:10]; scan=None; pt=None
+        eb=_ups(f_2b); pbb=_ups(f_pr); dnb=_ups(f_dn) or None
+        sig=_sig(pbb,eb,dnb or []); scan=None; pt=None
         try:
             if st.session_state.get("itc_sig")!=sig:
-                st.session_state["itc_pt"]=parse_2b_full(eb); st.session_state["itc_scan"]=scan_pbooks_any(pbb,dn_fb=dnb)
+                st.session_state["itc_pt"]=parse_2b_multi(eb); st.session_state["itc_scan"]=scan_pbooks_any(pbb,dn_fb=dnb)
                 st.session_state["itc_sig"]=sig; st.session_state.pop("itc_out",None); st.session_state.pop("itc_run",None)
             scan=st.session_state["itc_scan"]; pt=st.session_state["itc_pt"]
         except Exception as e:
@@ -107,27 +129,25 @@ with tab1:
             with st.expander("Details"): import traceback; st.code(traceback.format_exc())
         if scan is not None:
             pivot=(scan["kind"]=="legacy" and (scan["bw"]["_inv"].astype(str).str.strip()=="").all())
-            if pt.get("meta"): st.caption("GSTR-2B file: "+_meta_line(pt["meta"]))
+            if pt.get("meta"): st.caption(f"GSTR-2B ({len(pt['parts'])} file{'s' if len(pt['parts'])>1 else ''}): "+_meta_line(pt["meta"]))
+            if len(pt["parts"])>1 or len(scan["layout"])>1:
+                with st.expander("📁 Files read",expanded=len(pt["parts"])>1):
+                    st.dataframe(pd.DataFrame([{"2B file":p_["name"],"Month":_mlabel(p_["meta"]),"Invoices":p_["n_inv"],"Notes (CN/DN)":p_["n_notes"],"ISD":p_["n_isd"],"IMPG":p_["n_imp"]} for p_ in pt["parts"]]),hide_index=True,width="stretch")
+                    st.dataframe(pd.DataFrame([{"Books file / sheet":L_["sheet"],"Vouchers":L_["rows"]} for L_ in scan["layout"]]),hide_index=True,width="stretch")
             _bm = scan.get("meta", {})
             if _bm.get("company"): st.caption(f"Books: {_bm['company']} · {_bm.get('period','')}")
             pdates=[d for d in scan["bw"]["_date"] if pd.notna(d) and hasattr(d, "year")]
-            pst = pt.get("meta",{}).get("pstart")
-            b_pstart = _bm.get("pstart")
             edu_n = _bm.get("edu_count", 0)
-            if b_pstart and pst and (b_pstart.year != pst.year or b_pstart.month != pst.month):
-                st.error(f"⛔ TAX PERIOD MISMATCH: Books file indicates period '{_bm.get('period')}', but GSTR-2B is for {pst:%b-%Y} ({pt['meta'].get('FY','')})! Please verify that your files are for the same tax period.")
-            elif pdates and pst and edu_n == 0:
-                min_pd, max_pd = min(pdates), max(pdates)
-                if min_pd.year != pst.year or min_pd.month != pst.month:
-                    st.error(f"⛔ TAX PERIOD MISMATCH: Purchase vouchers are dated {min_pd:%d-%b-%Y} to {max_pd:%d-%b-%Y}, but GSTR-2B is for {pst:%b-%Y} ({pt['meta'].get('FY','')})! Please verify that your files are for the same tax period.")
+            _chk_period("Purchase vouchers","GSTR-2B file(s)",pdates,_bm,pt.get("meta",{}),edu_n)
             if edu_n > 0:
                 st.info(f"ℹ️ Tally Educational Mode detected: {edu_n} vouchers have 'Educational' date. Vouchers are reconciled on GSTIN, Invoice Number, and Tax amounts.")
             for w in scan["warns"]+pt["warns"]: st.warning(w)
             if pivot:
+                if len(pbb)>1 or len(eb)>1: st.warning("Party-wise (pivot) mode reads only the FIRST purchase file and FIRST 2B file. Export the flat Purchase Register to reconcile several months invoice-wise.")
                 st.warning("Purchase file is a party-level pivot (no invoice numbers) → running the party-wise reco. Export the flat Purchase Register for invoice-wise matching.")
                 if st.button("▶ Run ITC Reconciliation (party-wise)",type="primary",width="stretch",key="run_itc_old"):
                     try:
-                        df,det,impg,impg_r=run_itc_reco(pbb,eb); st.session_state["itc_old"]=(df,build_itc_excel(df,det,impg_r,impg,client,period).getvalue(),impg)
+                        df,det,impg,impg_r=run_itc_reco(pbb[0][1],eb[0][1]); st.session_state["itc_old"]=(df,build_itc_excel(df,det,impg_r,impg,client,period).getvalue(),impg)
                     except Exception as e: st.error(f"❌ {e}")
                 if st.session_state.get("itc_old"):
                     df,xb,impg=st.session_state["itc_old"]; cnt=df["Status"].value_counts().to_dict()
@@ -193,42 +213,39 @@ with tab2:
     st.markdown("### E-Invoice / GSTR-1 vs Books (Sales Register)")
     c1,c2=st.columns(2)
     with c1:
-        st.markdown("**File 1 — E-Invoice / GSTR-1 Portal Excel**")
+        st.markdown("**File 1 — E-Invoice / GSTR-1 Portal Excel(s)** — one file per month")
         st.markdown('<div class="fmtbox">GST Portal → E-Invoice → Download Excel<br>Sheets (invoices, credit/debit notes, HSN) are found by <b>header names</b> — sheet names and column order can be anything.<br>Needs headers: <code>Invoice number</code> · <code>Taxable Value</code> · <code>GSTIN</code> · tax columns</div>',unsafe_allow_html=True)
-        f_einv=st.file_uploader("E-Invoice Excel",type=["xlsx","xls"],key="sal_inv",label_visibility="collapsed")
+        f_einv=st.file_uploader("E-Invoice Excel",type=["xlsx","xls"],key="sal_inv",label_visibility="collapsed",accept_multiple_files=True)
     with c2:
-        st.markdown("**File 2 — Sales Register (Tally / SAP / Excel)**")
+        st.markdown("**File 2 — Sales Register (Tally / SAP / Excel)** — one file per month, or one for all")
         st.markdown('<div class="fmtbox">Any company format — columns are found by <b>header name</b>, in any order.<br>Needs headers: <code>Voucher No / Invoice No</code> · <code>Date</code> · <code>GSTIN</code> · <code>Gross Total</code> (optional) + your sales / IGST / CGST / SGST ledger columns. Ledger columns are auto-classified — review below.</div>',unsafe_allow_html=True)
-        f_sal=st.file_uploader("Sales Register",type=["xlsx","xls"],key="sal_bk",label_visibility="collapsed")
-        st.markdown("**File 2b — Credit Note Register** *(optional — if exported as a separate file)*")
-        f_cn=st.file_uploader("Credit Note Register (optional)",type=["xlsx","xls"],key="sal_cn",label_visibility="collapsed")
+        f_sal=st.file_uploader("Sales Register",type=["xlsx","xls"],key="sal_bk",label_visibility="collapsed",accept_multiple_files=True)
+        st.markdown("**File 2b — Credit Note Register(s)** *(optional — one or more files, if exported separately)*")
+        f_cn=st.file_uploader("Credit Note Register (optional)",type=["xlsx","xls"],key="sal_cn",label_visibility="collapsed",accept_multiple_files=True)
     if f_einv and f_sal:
-        eb=f_einv.getvalue(); bb=f_sal.getvalue(); cb=f_cn.getvalue() if f_cn else None
-        sig=hashlib.md5(eb+bb+(cb or b"")).hexdigest()[:10]
+        eb=_ups(f_einv); bb=_ups(f_sal); cb=_ups(f_cn) or None
+        sig=_sig(eb,bb,cb or [])
         scan=None
         try:
             if st.session_state.get("sal_sig")!=sig:
-                st.session_state["sal_scan"]=scan_books(bb,cn_fb=cb); st.session_state["sal_sig"]=sig; st.session_state.pop("sal_out",None); st.session_state.pop("sal_run",None)
+                st.session_state["sal_scan"]=scan_books(bb,cn_fb=cb); st.session_state["sal_pt"]=parse_portal_multi(eb); st.session_state["sal_sig"]=sig; st.session_state.pop("sal_out",None); st.session_state.pop("sal_run",None)
             scan=st.session_state["sal_scan"]
         except Exception as e:
             st.error(f"❌ {e}")
             with st.expander("Details"): import traceback; st.code(traceback.format_exc())
         if scan:
             try:
-                _pm=parse_portal(eb).get("meta",{})
-                if _pm.get("GSTIN") or _pm.get("Period"): st.caption("E-invoice file: "+_meta_line(_pm))
+                ptl=st.session_state["sal_pt"]; _pm=ptl.get("meta",{})
+                if _pm.get("GSTIN") or _pm.get("Period"): st.caption(f"E-invoice ({len(ptl['parts'])} file{'s' if len(ptl['parts'])>1 else ''}): "+_meta_line(_pm))
+                if len(ptl["parts"])>1 or len(scan["layout"])>1:
+                    with st.expander("📁 Files read",expanded=len(ptl["parts"])>1):
+                        st.dataframe(pd.DataFrame([{"Portal file":p_["name"],"Month":_mlabel(p_["meta"]),"Invoices":p_["n_inv"],"Notes (CN/DN)":p_["n_notes"]} for p_ in ptl["parts"]]),hide_index=True,width="stretch")
+                        st.dataframe(pd.DataFrame([{"Books file / sheet":L_["sheet"],"Vouchers":L_["rows"]} for L_ in scan["layout"]]),hide_index=True,width="stretch")
                 _bm = scan.get("meta", {})
                 if _bm.get("company"): st.caption(f"Books: {_bm['company']} · {_bm.get('period','')}")
                 bdates=[d for d in scan["bw"]["_date"] if pd.notna(d) and hasattr(d, "year")]
-                pst = _pm.get("pstart")
-                b_pstart = _bm.get("pstart")
                 edu_n = _bm.get("edu_count", 0)
-                if b_pstart and pst and (b_pstart.year != pst.year or b_pstart.month != pst.month):
-                    st.error(f"⛔ TAX PERIOD MISMATCH: Books file indicates period '{_bm.get('period')}', but the E-Invoice Portal file is for {pst:%b-%Y} ({_pm.get('FY','')})! Please verify that your Books export matches the portal period.")
-                elif bdates and pst and edu_n == 0:
-                    min_d, max_d = min(bdates), max(bdates)
-                    if min_d.year != pst.year or min_d.month != pst.month:
-                        st.error(f"⛔ TAX PERIOD MISMATCH: Books vouchers are dated {min_d:%d-%b-%Y} to {max_d:%d-%b-%Y}, but the E-Invoice Portal file is for {pst:%b-%Y} ({_pm.get('FY','')})! Comparing across different financial years will cause false mismatches. Please verify that your Books export matches the portal period.")
+                _chk_period("Books vouchers","E-Invoice portal file(s)",bdates,_bm,_pm,edu_n)
                 if edu_n > 0:
                     st.info(f"ℹ️ Tally Educational Mode detected: {edu_n} vouchers have 'Educational' date. Vouchers are reconciled on GSTIN, Invoice Number, and Tax amounts.")
             except Exception: pass
@@ -250,7 +267,7 @@ with tab2:
                 with st.spinner("Running sales reco..."):
                     try:
                         lc=dict(zip(led_ed["Ledger column"],led_ed["Class"])); vc=dict(zip(vkeys,vt_ed["Treat as"]))
-                        res=run_sales_reco(eb,bb,lc,vc,tol,scan=scan,cn_bytes=cb)
+                        res=run_sales_reco(None,None,lc,vc,tol,scan=scan,portal=st.session_state["sal_pt"])
                         rep_client = client if client != "Client" else (scan.get("meta",{}).get("company") or _pm.get("Legal name") or "Client")
                         rep_period = period if period != "Period" else (scan.get("meta",{}).get("period") or _pm.get("Period") or "Period")
                         buf=build_sales_excel(res,rep_client,rep_period)
@@ -290,33 +307,50 @@ with tab3:
     st.markdown("### GSTR-3B Audit Check — 3B vs GSTR-1 vs Books · 3B vs 2B vs ITC reco")
     st.markdown('<div class="fmtbox">Type the filed <b>GSTR-3B</b> and <b>GSTR-1</b> figures (from the portal PDF/summary). <b>2B</b>, <b>books sales</b> and <b>ITC-reco</b> references fill automatically when you have uploaded the 2B here or run the Sales / ITC tabs in this session. Every cell stays editable.</div>',unsafe_allow_html=True)
     st.markdown("**Step 1 — GSTR-2B Excel** *(optional if the ITC tab already has it)*")
-    f_2b3=st.file_uploader("GSTR-2B Excel",type=["xlsx","xls"],key="tb3_2b",label_visibility="collapsed")
+    f_2b3=st.file_uploader("GSTR-2B Excel",type=["xlsx","xls"],key="tb3_2b",label_visibility="collapsed",accept_multiple_files=True)
     pt3=None; src2b=""
     if f_2b3:
-        try: pt3=parse_2b_full(f_2b3.getvalue()); src2b="uploaded 2B"
+        try: pt3=parse_2b_multi(_ups(f_2b3)); src2b="uploaded 2B"
         except Exception as e: st.warning(f"Could not read 2B: {e}")
-    itc_valid=st.session_state.get("itc_sig") is not None and st.session_state.get("itc_sig")==_fsig("itc_pr","itc_2b")
-    sal_valid=st.session_state.get("sal_sig") is not None and st.session_state.get("sal_sig")==_fsig("sal_inv","sal_bk")
-    if (not f_2b3) and itc_valid and st.session_state.get("itc_pt") is not None: pt3=st.session_state["itc_pt"]; src2b="2B from ITC tab ("+str(getattr(st.session_state.get("itc_2b"),"name",""))+")"
+    itc_valid=st.session_state.get("itc_sig") is not None and st.session_state.get("itc_sig")==_fsig("itc_pr","itc_2b","itc_dn")
+    sal_valid=st.session_state.get("sal_sig") is not None and st.session_state.get("sal_sig")==_fsig("sal_inv","sal_bk","sal_cn")
+    if (not f_2b3) and itc_valid and st.session_state.get("itc_pt") is not None: pt3=st.session_state["itc_pt"]; src2b="2B from ITC tab ("+", ".join(p_["name"] for p_ in pt3["parts"])+")"
+    # a 3B covers ONE month: when several months were uploaded, pick the month(s) that match this 3B
+    multi3=bool(pt3 and len(pt3["parts"])>1); sel_files=None; sel_months=None
+    if multi3:
+        lab3={p_["name"]:f"{p_['name']} ({_mlabel(p_['meta'])})" for p_ in pt3["parts"]}
+        pick=st.multiselect("This 3B is for ONE month - which 2B month(s) should be used?",list(lab3),default=list(lab3)[:1],format_func=lambda n:lab3[n],key="tb3_pick")
+        if not pick: pick=list(lab3)[:1]
+        pt3=merge_2b_parts([p_ for p_ in pt3["parts"] if p_["name"] in pick]); sel_files=set(pick)
+    if pt3: sel_months={(p_["meta"]["pstart"].year,p_["meta"]["pstart"].month) for p_ in pt3["parts"] if p_["meta"].get("pstart")} or None
+    def _pick_portal(pe):
+        """e-invoice / GSTR-1 files for the selected month(s) only"""
+        if pe is None or len(pe.get("parts",[]))<2 or not sel_months: return pe
+        ps=[p_ for p_ in pe["parts"] if p_["meta"].get("pstart") and (p_["meta"]["pstart"].year,p_["meta"]["pstart"].month) in sel_months]
+        return merge_portal_parts(ps) if ps else pe
     t2b_def=twob_refs(pt3) if pt3 else zero_tbl(ROWS_2B)
     sal=st.session_state.get("sal_out") if sal_valid else None; itcx=st.session_state.get("itc_out") if itc_valid else None
     tbk_def=zero_tbl(ROWS_BK); tib_def=zero_tbl(ROWS_IB); tei_def=zero_tbl(ROWS_EI); srcs=[]
     st.markdown("**Step 1b — E-invoice / GSTR-1 portal Excel** *(optional — gives a B2B outward reference before you type GSTR-1)*")
-    f_ei=st.file_uploader("E-invoice Excel",type=["xlsx","xls"],key="tb3_ei",label_visibility="collapsed")
+    f_ei=st.file_uploader("E-invoice Excel",type=["xlsx","xls"],key="tb3_ei",label_visibility="collapsed",accept_multiple_files=True)
     metas=[]
     if pt3 and pt3.get("meta"): metas.append(("2B",pt3["meta"]))
     if f_ei:
-        try: pe_=parse_portal(f_ei.getvalue()); tei_def=einv_net(pe_); srcs.append("e-invoice reference ← uploaded file"); metas.append(("E-invoice",pe_.get("meta",{})))
+        try: pe_=_pick_portal(parse_portal_multi(_ups(f_ei))); tei_def=einv_net(pe_); srcs.append("e-invoice reference ← uploaded file(s)"); metas.append(("E-invoice",pe_.get("meta",{})))
         except Exception as e: st.warning(f"Could not read e-invoice file: {e}")
-    elif sal: tei_def=einv_net(sal[0]["portal"]); metas.append(("E-invoice",sal[0]["portal"].get("meta",{}))); srcs.append("e-invoice reference ← Sales Reco tab ("+str(getattr(st.session_state.get("sal_inv"),"name",""))+")")
+    elif sal:
+        pe_=_pick_portal(sal[0]["portal"]); tei_def=einv_net(pe_); metas.append(("E-invoice",pe_.get("meta",{}))); srcs.append("e-invoice reference ← Sales Reco tab ("+", ".join(n_ for n_,_ in _ups(st.session_state.get("sal_inv")))+")")
     if sal:
-        bs=books_sales_net(sal[0]); 
+        bs=books_sales_net(sal[0],months=sel_months if multi3 else None)
         for c in COLS3: tbk_def.loc[0,c]=bs[c]
-        srcs.append("books sales ← Sales Reco tab ("+str(getattr(st.session_state.get("sal_bk"),"name",""))+")")
+        srcs.append("books sales ← Sales Reco tab ("+", ".join(n_ for n_,_ in _ups(st.session_state.get("sal_bk")))+")")
     if itcx:
-        e,rc=itc_reco_refs(itcx[0])
+        _itc_names={p_["name"] for p_ in itcx[0]["pt"]["parts"]}
+        _use_f=sel_files if (multi3 and sel_files and sel_files<=_itc_names) else None
+        e,rc=itc_reco_refs(itcx[0],files=_use_f,months=sel_months if _use_f else None)
+        if multi3 and not _use_f: st.warning("ITC reference covers ALL months run in the ITC tab (the 2B files chosen here are not the ones used there) - edit the references or run that month alone.")
         for k,c in enumerate(COLS3[1:]): tib_def.loc[0,c]=e[k]; tib_def.loc[1,c]=rc[k]
-        srcs.append("ITC reference ← ITC Reco tab ("+str(getattr(st.session_state.get("itc_pr"),"name",""))+")")
+        srcs.append("ITC reference ← ITC Reco tab ("+", ".join(n_ for n_,_ in _ups(st.session_state.get("itc_pr")))+")")
     if src2b: srcs.append(src2b)
     if srcs: st.caption("Auto-filled: "+" · ".join(srcs))
     ssig=hashlib.md5((str(t2b_def.values.tolist())+str(tbk_def.values.tolist())+str(tib_def.values.tolist())+str(tei_def.values.tolist())).encode()).hexdigest()[:8]
@@ -375,4 +409,4 @@ with tab3:
         """)
 
 st.markdown("---")
-st.markdown('<div style="text-align:center;font-size:.74rem;color:#888">GST Audit Reconciliation Tool · Built by <a href="https://linkedin.com/in/purvadoshi26" style="color:#5585B5">Purva Doshi</a> · build 2026-11-19 r3</div>',unsafe_allow_html=True)
+st.markdown('<div style="text-align:center;font-size:.74rem;color:#888">GST Audit Reconciliation Tool · Built by <a href="https://linkedin.com/in/purvadoshi26" style="color:#5585B5">Purva Doshi</a> · build 2026-11-19 r4 · multi-month upload</div>',unsafe_allow_html=True)
